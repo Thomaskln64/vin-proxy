@@ -1,0 +1,14 @@
+# secrets
+.env
+
+# dependencies
+node_modules/
+
+# generated reports
+reports/
+*.pdf
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
