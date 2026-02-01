@@ -1,10 +1,13 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const puppeteer = require('puppeteer');
+
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,10 +24,16 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}
 const REPORTS_DIR = path.join(__dirname, 'reports');
 const DOWNLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Render erkennt man oft über NODE_ENV=production, alternativ kannst du RENDER=true setzen
+const IS_PROD =
+  (process.env.NODE_ENV || '').toLowerCase() === 'production' ||
+  (process.env.RENDER || '').toLowerCase() === 'true';
+
 if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
   console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in .env');
   process.exit(1);
 }
+
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 app.use(cors());
@@ -32,12 +41,15 @@ app.use(express.json());
 
 // ===== In-memory download store =====
 const downloadStore = new Map();
+
 function putDownload(token, filePath, meta = {}) {
   downloadStore.set(token, { filePath, meta, expiresAt: Date.now() + DOWNLOAD_TTL_MS });
 }
+
 function getDownload(token) {
   const item = downloadStore.get(token);
   if (!item) return null;
+
   if (Date.now() > item.expiresAt) {
     downloadStore.delete(token);
     return null;
@@ -49,6 +61,7 @@ function getDownload(token) {
 function sanitizeVin(vin) {
   return String(vin || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 25);
 }
+
 function escapeHtml(s) {
   return String(s ?? '')
     .replaceAll('&', '&amp;')
@@ -57,23 +70,33 @@ function escapeHtml(s) {
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 }
+
 function pick(decodeArr, label) {
   if (!Array.isArray(decodeArr)) return undefined;
   const hit = decodeArr.find(d => d.label === label);
   return hit ? hit.value : undefined;
 }
+
 function makeControlSum(vin, action) {
   const hashString = `${vin}|${action}|${VINCARIO_API_KEY}|${VINCARIO_SECRET_KEY}`;
   return crypto.createHash('sha1').update(hashString).digest('hex').substring(0, 10);
 }
+
 async function getJson(url, headers = {}) {
   const fetch = (await import('node-fetch')).default;
   const resp = await fetch(url, { headers });
   const text = await resp.text();
+
   let json = {};
-  try { json = JSON.parse(text); } catch { json = {}; }
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = {};
+  }
+
   return { ok: resp.ok, status: resp.status, json, rawText: text };
 }
+
 async function vincarioGet(vin, action) {
   const v = sanitizeVin(vin);
   const controlSum = makeControlSum(v, action);
@@ -81,6 +104,7 @@ async function vincarioGet(vin, action) {
   if (DEBUG) console.log('🔗 Vincario:', url);
   return await getJson(url);
 }
+
 function stripInternalFields(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const copy = JSON.parse(JSON.stringify(obj));
@@ -89,6 +113,7 @@ function stripInternalFields(obj) {
   delete copy.price_currency;
   return copy;
 }
+
 function summarizeStolen(stolenJson) {
   const rows = stolenJson?.stolen;
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -101,21 +126,25 @@ function summarizeStolen(stolenJson) {
     details: rows.map(r => ({ source: r.code, status: r.status }))
   };
 }
+
 function summarizeMarketValue(valueJson) {
   if (!valueJson || valueJson.error) {
     return { available: false, reason: valueJson?.message || 'no_data' };
   }
   return { available: true, data: valueJson };
 }
+
 function stolenLabel(status) {
   if (status === 'not-stolen') return 'Nicht als gestohlen gemeldet';
   if (status === 'stolen') return 'Achtung: Als gestohlen gemeldet';
   return 'Unbekannt';
 }
+
 function yesNoUnknown(v) {
   if (v === null || v === undefined || v === '') return '—';
   return String(v);
 }
+
 function makeReportId(vin) {
   const day = new Date().toISOString().slice(0, 10);
   return crypto.createHash('sha1').update(`${vin}|${day}`).digest('hex').substring(0, 10).toUpperCase();
@@ -273,10 +302,10 @@ function renderReportHtml(report) {
     overflow:hidden;
     margin-bottom:12px;
   }
-    .topline:before{
-  content:"";
-  position:absolute;left:0;top:0;bottom:0;width:12px;
-  background:var(--brandRed);
+  .topline:before{
+    content:"";
+    position:absolute;left:0;top:0;bottom:0;width:12px;
+    background:var(--brandRed);
   }
   .h1{font-size:20px;font-weight:950;margin:0 0 4px 0}
   .meta{color:#e2e8f0;opacity:.95;font-size:12px}
@@ -525,8 +554,10 @@ function renderReportHtml(report) {
 // ===== PDF Renderer =====
 async function renderPdfToFile(html, outPath) {
   const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    headless: IS_PROD ? chromium.headless : 'new',
+    executablePath: IS_PROD ? await chromium.executablePath() : undefined,
+    args: IS_PROD ? chromium.args : ['--no-sandbox', '--disable-setuid-sandbox'],
+    defaultViewport: IS_PROD ? chromium.defaultViewport : { width: 1280, height: 720 }
   });
 
   try {
