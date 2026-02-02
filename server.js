@@ -29,45 +29,13 @@ const IS_PROD =
   (process.env.NODE_ENV || '').toLowerCase() === 'production' ||
   (process.env.RENDER || '').toLowerCase() === 'true';
 
-// Optional: Webhook absichern (wenn gesetzt, muss Header passen)
-const WIX_WEBHOOK_SECRET = process.env.WIX_WEBHOOK_SECRET || "";
-
-// ===== Checkout-Intent Store (purchaseFlowId -> vin/email) =====
-// TTL bewusst kurz, weil es nur die Zeit zwischen Checkout-Start und Payment abdeckt.
-const INTENT_TTL_MS = 6 * 60 * 60 * 1000; // 6 Stunden
-const checkoutIntentStore = new Map();
-
-function putIntent(purchaseFlowId, vin, email) {
-  const key = String(purchaseFlowId || '').trim();
-  if (!key) return;
-  checkoutIntentStore.set(key, {
-    vin: sanitizeVin(vin),
-    email: String(email || '').trim(),
-    createdAt: Date.now(),
-    expiresAt: Date.now() + INTENT_TTL_MS
-  });
-}
-
-function getIntent(purchaseFlowId) {
-  const key = String(purchaseFlowId || '').trim();
-  if (!key) return null;
-  const item = checkoutIntentStore.get(key);
-  if (!item) return null;
-
-  if (Date.now() > item.expiresAt) {
-    checkoutIntentStore.delete(key);
-    return null;
-  }
-  return item;
-}
-
-// Optional: Cleanup, damit Map nicht ewig wächst
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of checkoutIntentStore.entries()) {
-    if (!v || now > v.expiresAt) checkoutIntentStore.delete(k);
-  }
-}, 15 * 60 * 1000).unref();
+// Build-ID fürs Debuggen (zeigt dir: welcher Deploy läuft wirklich live)
+const BUILD_ID =
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.RENDER_COMMIT ||
+  process.env.COMMIT_REF ||
+  process.env.RENDER_SERVICE_ID ||
+  'local';
 
 if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
   console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in .env');
@@ -77,7 +45,7 @@ if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json());
 
 // ===== In-memory download store =====
 const downloadStore = new Map();
@@ -305,10 +273,13 @@ function renderReportHtml(report) {
 <style>
   :root{
     --brandRed:#9F1239;
+
     --text:#0f172a;
     --muted:#475569;
+    --muted2:#64748b;
     --line:rgba(15,23,42,.12);
     --soft:#f8fafc;
+
     --ok:#16a34a;
     --warn:#f59e0b;
     --bad:#ef4444;
@@ -317,34 +288,72 @@ function renderReportHtml(report) {
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);background:#fff}
   .page{padding:22px 24px;page-break-after:always}
   .page:last-child{page-break-after:auto}
+
   .header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
   .brand{font-weight:950;font-size:18px;color:var(--text)}
   .sub{color:var(--muted);font-size:12px;margin-top:3px;line-height:1.4}
+
   .chip{
     display:inline-block;padding:8px 10px;border-radius:999px;
     border:1px solid rgba(225,29,72,.25);
-    background:#fff;color:var(--text);font-size:12px;white-space:nowrap;
+    background:linear-gradient(180deg,#fff, #fff);
+    color:var(--text);font-size:12px;white-space:nowrap;
   }
+
   .topline{
-    border:1px solid var(--line);border-radius:16px;padding:12px 14px;
+    border:1px solid var(--line);
+    border-radius:16px;
+    padding:12px 14px;
     background:linear-gradient(180deg,#0b1220,#0f1a33);
-    color:#fff;position:relative;overflow:hidden;margin-bottom:12px;
+    color:#fff;
+    position:relative;
+    overflow:hidden;
+    margin-bottom:12px;
   }
-  .topline:before{content:"";position:absolute;left:0;top:0;bottom:0;width:12px;background:var(--brandRed);}
+  .topline:before{
+    content:"";
+    position:absolute;left:0;top:0;bottom:0;width:12px;
+    background:var(--brandRed);
+  }
   .h1{font-size:20px;font-weight:950;margin:0 0 4px 0}
   .meta{color:#e2e8f0;opacity:.95;font-size:12px}
+
   .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px}
   .twoCol{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+
   .box{border:1px solid var(--line);border-radius:14px;padding:12px;background:#fff}
-  .secH{font-size:13px;font-weight:950;margin:0 0 8px 0;padding-left:10px;border-left:4px solid var(--brandRed);}
+  .secH{
+    font-size:13px;font-weight:950;margin:0 0 8px 0;color:var(--text);
+    padding-left:10px;
+    border-left:4px solid var(--brandRed);
+  }
   .para{color:var(--muted);font-size:12px;line-height:1.6}
-  .pill{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px}
+
+  .pill{
+    display:flex;gap:10px;align-items:flex-start;
+    border:1px solid var(--line);
+    border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px
+  }
   .dot{width:10px;height:10px;border-radius:50%;margin-top:4px}
-  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+  .dot.ok{background:var(--ok)}
+  .dot.warn{background:var(--warn)}
+  .dot.bad{background:var(--bad)}
   .small{color:var(--muted);font-size:12px;line-height:1.5}
-  .table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border-radius:14px;border:1px solid rgba(15,23,42,.14);margin-top:8px;}
-  .table th,.table td{padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);font-size:12px;color:var(--text);background:#fff;}
-  .table th{background:var(--soft);text-align:left;}
+
+  .table{
+    width:100%;
+    border-collapse:separate;border-spacing:0;
+    overflow:hidden;border-radius:14px;
+    border:1px solid rgba(15,23,42,.14);
+    margin-top:8px;
+  }
+  .table th,.table td{
+    padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);
+    font-size:12px;color:var(--text);background:#fff;
+  }
+  .table th{
+    background:var(--soft);text-align:left;
+  }
   .table tr:last-child td{border-bottom:none}
 </style>
 </head>
@@ -573,15 +582,31 @@ async function renderPdfToFile(html, outPath) {
   }
 }
 
-// ===== Simple webhook auth helper =====
-function checkWebhookSecret(req) {
-  if (!WIX_WEBHOOK_SECRET) return true; // nicht aktiviert
-  const got = String(req.headers['x-fzb-webhook'] || '').trim();
-  return got && got === WIX_WEBHOOK_SECRET;
-}
-
 // ===== Routes =====
 app.get('/', (_req, res) => res.send('✅ FZB-24 VIN Report API läuft'));
+
+app.get('/api/version', (_req, res) => {
+  return res.status(200).json({ ok: true, build: BUILD_ID });
+});
+
+// Debug: zeigt, ob die Route registriert ist (verhindert “404 => Route existiert nicht”)
+app.get('/api/order-from-wix', (_req, res) => {
+  return res.status(200).json({ ok: true, msg: 'order-from-wix route is registered', build: BUILD_ID });
+});
+
+// Debug: POST test (wir bauen das später “echt” aus)
+app.post('/api/order-from-wix', async (req, res) => {
+  try {
+    return res.status(200).json({
+      ok: true,
+      msg: 'POST received',
+      build: BUILD_ID,
+      body: req.body
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 app.get('/download/:token', (req, res) => {
   const item = getDownload(req.params.token);
@@ -589,7 +614,6 @@ app.get('/download/:token', (req, res) => {
   return res.download(item.filePath);
 });
 
-// Preview
 app.get('/api/report/:vin', async (req, res) => {
   try {
     const built = await buildPreviewReport(req.params.vin);
@@ -612,7 +636,6 @@ app.get('/api/report/:vin', async (req, res) => {
   }
 });
 
-// Premium JSON (für Debug)
 app.get('/api/premium-report/:vin', async (req, res) => {
   try {
     const built = await buildPremiumReport(req.params.vin, null);
@@ -624,7 +647,6 @@ app.get('/api/premium-report/:vin', async (req, res) => {
   }
 });
 
-// ALT (Test): erstellt sofort PDF ohne Payment (kannst du später löschen)
 app.post('/api/order', async (req, res) => {
   try {
     const { vin, email } = req.body || {};
@@ -659,127 +681,6 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
-// ===== NEU: Checkout Intent speichern =====
-// Wird von deiner Wix-Seite aufgerufen, sobald du purchaseFlowId + vin/email hast.
-app.post('/api/checkout-intent', async (req, res) => {
-  try {
-    const { purchaseFlowId, vin, email } = req.body || {};
-    const pf = String(purchaseFlowId || '').trim();
-    const v = sanitizeVin(vin);
-    const e = String(email || '').trim();
-
-    if (!pf) return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
-    if (!v || v.length < 11) return res.status(400).json({ success: false, error: 'invalid_vin' });
-    if (!e || !e.includes('@')) return res.status(400).json({ success: false, error: 'invalid_email' });
-
-    putIntent(pf, v, e);
-
-    if (DEBUG) console.log('🧩 intent saved', { purchaseFlowId: pf, vin: v, email: e });
-
-    return res.status(200).json({ success: true, status: 'saved', purchaseFlowId: pf });
-  } catch (err) {
-    console.error('❌ Fehler /api/checkout-intent:', err);
-    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
-  }
-});
-
-// ===== NEU: Wix Automation Hook =====
-// Trigger: "Payment Added to Order"
-// Action: "HTTP-Anfrage senden" (POST) -> /api/order-from-wix
-app.post('/api/order-from-wix', async (req, res) => {
-  try {
-    if (!checkWebhookSecret(req)) {
-      return res.status(401).json({ success: false, error: 'unauthorized' });
-    }
-
-    const { purchaseFlowId, email } = req.body || {};
-    const pf = String(purchaseFlowId || '').trim();
-    const e = String(email || '').trim();
-
-    if (!pf) return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
-    if (!e || !e.includes('@')) return res.status(400).json({ success: false, error: 'missing_or_invalid_email' });
-
-    const intent = getIntent(pf);
-    if (!intent || !intent.vin) {
-      return res.status(404).json({
-        success: false,
-        error: 'intent_not_found',
-        hint: 'Server kennt purchaseFlowId nicht (checkout-intent wurde nicht gespeichert oder ist abgelaufen).',
-        purchaseFlowId: pf
-      });
-    }
-
-    // Falls Wix eine andere Email liefert (Checkout Email), nehmen wir die:
-    const finalEmail = e || intent.email;
-
-    const built = await buildPremiumReport(intent.vin, finalEmail);
-    if (!built.ok) return res.status(502).json({ success: false, ...built });
-
-    const report = built.report;
-    const html = renderReportHtml(report);
-
-    const safeVin = sanitizeVin(report.vin);
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const fileName = `FZB24_${safeVin}_${stamp}.pdf`;
-    const filePath = path.join(REPORTS_DIR, fileName);
-
-    await renderPdfToFile(html, filePath);
-
-    const token = crypto.randomBytes(16).toString('hex');
-    putDownload(token, filePath, { vin: report.vin, email: finalEmail, purchaseFlowId: pf });
-
-    // (Noch kein E-Mail Versand hier – kommt als nächster Schritt)
-    return res.status(200).json({
-      success: true,
-      status: 'pdf_ready',
-      vin: report.vin,
-      report_id: report.report_id,
-      download_url: `${PUBLIC_BASE_URL}/download/${token}`
-    });
-  } catch (err) {
-    console.error('❌ Fehler /api/order-from-wix:', err);
-    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
-  }
-});
-
-// Debug: prüfen ob intent gespeichert ist
-app.get('/api/wix-order/:purchaseFlowId', (req, res) => {
-  const pf = String(req.params.purchaseFlowId || '').trim();
-  const intent = getIntent(pf);
-  if (!intent) return res.status(404).json({ success: false, error: 'not_found' });
-  return res.status(200).json({ success: true, purchaseFlowId: pf, intent });
-});
-
-// ===== Wix Automation Webhook (Payment Added to Order) =====
-// Erwartet JSON: { purchaseFlowId: "...", email: "..." }
-app.post('/api/order-from-wix', async (req, res) => {
-  try {
-    const purchaseFlowId = String(req.body?.purchaseFlowId || '').trim();
-    const email = String(req.body?.email || '').trim();
-
-    if (!purchaseFlowId) {
-      return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
-    }
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ success: false, error: 'missing_or_invalid_email' });
-    }
-
-    // Erstmal nur Proof-of-Life Logging, damit wir sehen: Wix → Server klappt
-    console.log('✅ Wix webhook received:', { purchaseFlowId, email });
-
-    return res.status(200).json({
-      success: true,
-      received: true,
-      purchaseFlowId,
-      email
-    });
-  } catch (err) {
-    console.error('❌ Fehler /api/order-from-wix:', err);
-    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
-  }
-});
-
-
 app.listen(PORT, () => {
-  console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL}`);
+  console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL} (build=${BUILD_ID})`);
 });
