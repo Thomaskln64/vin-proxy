@@ -750,6 +750,36 @@ app.get('/api/wix-order/:purchaseFlowId', (req, res) => {
   return res.status(200).json({ success: true, purchaseFlowId: pf, intent });
 });
 
+// ===== Wix Automation Webhook (Payment Added to Order) =====
+// Erwartet JSON: { purchaseFlowId: "...", email: "..." }
+app.post('/api/order-from-wix', async (req, res) => {
+  try {
+    const purchaseFlowId = String(req.body?.purchaseFlowId || '').trim();
+    const email = String(req.body?.email || '').trim();
+
+    if (!purchaseFlowId) {
+      return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
+    }
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ success: false, error: 'missing_or_invalid_email' });
+    }
+
+    // Erstmal nur Proof-of-Life Logging, damit wir sehen: Wix → Server klappt
+    console.log('✅ Wix webhook received:', { purchaseFlowId, email });
+
+    return res.status(200).json({
+      success: true,
+      received: true,
+      purchaseFlowId,
+      email
+    });
+  } catch (err) {
+    console.error('❌ Fehler /api/order-from-wix:', err);
+    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
+  }
+});
+
+
 app.listen(PORT, () => {
   console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL}`);
 });
