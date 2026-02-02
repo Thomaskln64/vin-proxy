@@ -650,6 +650,55 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
+/* ============================================================
+   ✅ Schritt 3.2.4: Wix Automation Endpoint (Payment Added to Order)
+   - Wird von Wix Automation per HTTP POST aufgerufen
+   - Wir speichern erstmal purchaseFlowId + email
+   - VIN mappen wir im nächsten Schritt sauber dazu
+   ============================================================ */
+
+// in-memory store: purchaseFlowId -> { email, createdAt }
+const wixOrders = new Map();
+
+function putWixOrder(purchaseFlowId, payload) {
+  wixOrders.set(String(purchaseFlowId), { ...payload, createdAt: Date.now() });
+}
+
+function getWixOrder(purchaseFlowId) {
+  return wixOrders.get(String(purchaseFlowId)) || null;
+}
+
+// Wix Automation POST -> /api/order-from-wix
+app.post('/api/order-from-wix', async (req, res) => {
+  try {
+    const { purchaseFlowId, email } = req.body || {};
+
+    if (!purchaseFlowId || typeof purchaseFlowId !== 'string') {
+      return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
+    }
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({ success: false, error: 'missing_email' });
+    }
+
+    putWixOrder(purchaseFlowId, { email });
+
+    console.log('✅ Wix payment received:', { purchaseFlowId, email });
+
+    // Wichtig: Wix Automation erwartet nur "200 OK", sonst markiert es als Fehler.
+    return res.status(200).json({ success: true, status: 'received' });
+  } catch (err) {
+    console.error('❌ Fehler /api/order-from-wix:', err);
+    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
+  }
+});
+
+// Debug route (optional)
+app.get('/api/wix-order/:purchaseFlowId', (req, res) => {
+  const item = getWixOrder(req.params.purchaseFlowId);
+  if (!item) return res.status(404).json({ success: false, error: 'not_found' });
+  return res.json({ success: true, data: item });
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL}`);
 });
