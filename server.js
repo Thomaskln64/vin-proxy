@@ -29,14 +29,6 @@ const IS_PROD =
   (process.env.NODE_ENV || '').toLowerCase() === 'production' ||
   (process.env.RENDER || '').toLowerCase() === 'true';
 
-// Build-ID fürs Debuggen (zeigt dir: welcher Deploy läuft wirklich live)
-const BUILD_ID =
-  process.env.RENDER_GIT_COMMIT ||
-  process.env.RENDER_COMMIT ||
-  process.env.COMMIT_REF ||
-  process.env.RENDER_SERVICE_ID ||
-  'local';
-
 if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
   console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in .env');
   process.exit(1);
@@ -585,26 +577,57 @@ async function renderPdfToFile(html, outPath) {
 // ===== Routes =====
 app.get('/', (_req, res) => res.send('✅ FZB-24 VIN Report API läuft'));
 
+/**
+ * Wichtig: Damit du sofort siehst was LIVE ist:
+ * - version: zeigt commit-ish / timestamp
+ */
 app.get('/api/version', (_req, res) => {
-  return res.status(200).json({ ok: true, build: BUILD_ID });
+  res.status(200).json({
+    success: true,
+    service: 'fzb-24-api',
+    node: process.version,
+    env: (process.env.NODE_ENV || 'unknown'),
+    is_prod: IS_PROD,
+    // Render hat je nach Setup unterschiedliche envs – wir geben mehrere aus:
+    render_commit:
+      process.env.RENDER_GIT_COMMIT ||
+      process.env.GIT_COMMIT ||
+      process.env.COMMIT_SHA ||
+      null,
+    deployed_at: new Date().toISOString()
+  });
 });
 
-// Debug: zeigt, ob die Route registriert ist (verhindert “404 => Route existiert nicht”)
-app.get('/api/order-from-wix', (_req, res) => {
-  return res.status(200).json({ ok: true, msg: 'order-from-wix route is registered', build: BUILD_ID });
-});
-
-// Debug: POST test (wir bauen das später “echt” aus)
+/**
+ * Wix → Webhook/Automation Endpoint (Smoke-Test)
+ * Jetzt erstmal nur: Route existiert + Payload wird angenommen.
+ * Später verbinden wir das mit Order, PDF, Mail.
+ */
 app.post('/api/order-from-wix', async (req, res) => {
   try {
+    const { purchaseFlowId, email, vin } = req.body || {};
+
+    // minimaler Check (damit du direkt klare Fehler bekommst)
+    if (!purchaseFlowId || typeof purchaseFlowId !== 'string') {
+      return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
+    }
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, error: 'missing_email' });
+    }
+
+    // vin ist optional in dieser Phase (weil du es evtl. noch aus Session / Wix holen willst)
     return res.status(200).json({
-      ok: true,
-      msg: 'POST received',
-      build: BUILD_ID,
-      body: req.body
+      success: true,
+      received: {
+        purchaseFlowId,
+        email,
+        vin: vin ? sanitizeVin(vin) : null
+      },
+      next: 'Wire this to PDF+Mail after payment verification'
     });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+  } catch (err) {
+    console.error('❌ Fehler /api/order-from-wix:', err);
+    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
   }
 });
 
@@ -682,5 +705,5 @@ app.post('/api/order', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL} (build=${BUILD_ID})`);
+  console.log(`✅ Server läuft auf ${PUBLIC_BASE_URL}`);
 });
