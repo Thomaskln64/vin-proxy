@@ -8,6 +8,7 @@ const fs = require('fs');
 
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,6 +22,12 @@ const VINCARIO_SECRET_KEY = process.env.VINCARIO_SECRET_KEY;
 const DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
 
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+
+// Webhook-Absicherung (Wix Automation soll diesen Wert mitschicken)
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+
 const REPORTS_DIR = path.join(__dirname, 'reports');
 const DOWNLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -33,23 +40,25 @@ if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
   console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in .env');
   process.exit(1);
 }
-
+if (!SMTP_USER || !SMTP_PASS) {
+  console.error('❌ Missing SMTP_USER or SMTP_PASS in .env (Gmail App Password required)');
+  process.exit(1);
+}
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
-// ===== In-memory download store =====
+// ===== In-memory stores =====
+
+// Für Downloadlinks (optional, wir verschicken zwar per Mail, aber Link ist praktisch als Backup)
 const downloadStore = new Map();
-
 function putDownload(token, filePath, meta = {}) {
   downloadStore.set(token, { filePath, meta, expiresAt: Date.now() + DOWNLOAD_TTL_MS });
 }
-
 function getDownload(token) {
   const item = downloadStore.get(token);
   if (!item) return null;
-
   if (Date.now() > item.expiresAt) {
     downloadStore.delete(token);
     return null;
@@ -57,61 +66,13 @@ function getDownload(token) {
   return item;
 }
 
-// ===== Paid store (persisted) =====
-// Speichert purchaseFlowId -> { email, paidAt }
-const PAID_STORE_FILE = path.join(REPORTS_DIR, 'paid-store.json');
-let paidStore = {};
-
-function loadPaidStore() {
-  try {
-    if (!fs.existsSync(PAID_STORE_FILE)) {
-      paidStore = {};
-      return;
-    }
-    const raw = fs.readFileSync(PAID_STORE_FILE, 'utf8');
-    paidStore = JSON.parse(raw || '{}') || {};
-  } catch (e) {
-    console.error('❌ paid-store load failed:', e);
-    paidStore = {};
-  }
-}
-
-function savePaidStore() {
-  try {
-    fs.writeFileSync(PAID_STORE_FILE, JSON.stringify(paidStore, null, 2), 'utf8');
-  } catch (e) {
-    console.error('❌ paid-store save failed:', e);
-  }
-}
-
-function markPaid(purchaseFlowId, email) {
-  const id = String(purchaseFlowId || '').trim();
-  if (!id) return;
-  paidStore[id] = { email: String(email || '').trim().toLowerCase(), paidAt: new Date().toISOString() };
-  savePaidStore();
-}
-
-function isPaid(purchaseFlowId, email) {
-  const id = String(purchaseFlowId || '').trim();
-  if (!id) return false;
-  const rec = paidStore[id];
-  if (!rec) return false;
-
-  // wenn email mitgegeben wird, matchen wir sie
-  if (email) {
-    const e = String(email || '').trim().toLowerCase();
-    if (rec.email && e && rec.email !== e) return false;
-  }
-  return true;
-}
-
-loadPaidStore();
+// Idempotenz: wenn Wix mehrfach triggert, versenden wir nicht doppelt
+const processedFlows = new Map(); // purchaseFlowId -> { at, result }
 
 // ===== Helpers =====
 function sanitizeVin(vin) {
   return String(vin || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 25);
 }
-
 function escapeHtml(s) {
   return String(s ?? '')
     .replaceAll('&', '&amp;')
@@ -120,33 +81,23 @@ function escapeHtml(s) {
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 }
-
 function pick(decodeArr, label) {
   if (!Array.isArray(decodeArr)) return undefined;
   const hit = decodeArr.find(d => d.label === label);
   return hit ? hit.value : undefined;
 }
-
 function makeControlSum(vin, action) {
   const hashString = `${vin}|${action}|${VINCARIO_API_KEY}|${VINCARIO_SECRET_KEY}`;
   return crypto.createHash('sha1').update(hashString).digest('hex').substring(0, 10);
 }
-
 async function getJson(url, headers = {}) {
   const fetch = (await import('node-fetch')).default;
   const resp = await fetch(url, { headers });
   const text = await resp.text();
-
   let json = {};
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = {};
-  }
-
+  try { json = JSON.parse(text); } catch { json = {}; }
   return { ok: resp.ok, status: resp.status, json, rawText: text };
 }
-
 async function vincarioGet(vin, action) {
   const v = sanitizeVin(vin);
   const controlSum = makeControlSum(v, action);
@@ -154,7 +105,6 @@ async function vincarioGet(vin, action) {
   if (DEBUG) console.log('🔗 Vincario:', url);
   return await getJson(url);
 }
-
 function stripInternalFields(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const copy = JSON.parse(JSON.stringify(obj));
@@ -163,7 +113,6 @@ function stripInternalFields(obj) {
   delete copy.price_currency;
   return copy;
 }
-
 function summarizeStolen(stolenJson) {
   const rows = stolenJson?.stolen;
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -176,25 +125,21 @@ function summarizeStolen(stolenJson) {
     details: rows.map(r => ({ source: r.code, status: r.status }))
   };
 }
-
 function summarizeMarketValue(valueJson) {
   if (!valueJson || valueJson.error) {
     return { available: false, reason: valueJson?.message || 'no_data' };
   }
   return { available: true, data: valueJson };
 }
-
 function stolenLabel(status) {
   if (status === 'not-stolen') return 'Nicht als gestohlen gemeldet';
   if (status === 'stolen') return 'Achtung: Als gestohlen gemeldet';
   return 'Unbekannt';
 }
-
 function yesNoUnknown(v) {
   if (v === null || v === undefined || v === '') return '—';
   return String(v);
 }
-
 function makeReportId(vin) {
   const day = new Date().toISOString().slice(0, 10);
   return crypto.createHash('sha1').update(`${vin}|${day}`).digest('hex').substring(0, 10).toUpperCase();
@@ -327,72 +272,28 @@ function renderReportHtml(report) {
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);background:#fff}
   .page{padding:22px 24px;page-break-after:always}
   .page:last-child{page-break-after:auto}
-
   .header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
   .brand{font-weight:950;font-size:18px;color:var(--text)}
   .sub{color:var(--muted);font-size:12px;margin-top:3px;line-height:1.4}
-
-  .chip{
-    display:inline-block;padding:8px 10px;border-radius:999px;
-    border:1px solid rgba(225,29,72,.25);
-    background:#fff;
-    color:var(--text);font-size:12px;white-space:nowrap;
-  }
-
-  .topline{
-    border:1px solid var(--line);
-    border-radius:16px;
-    padding:12px 14px;
-    background:linear-gradient(180deg,#0b1220,#0f1a33);
-    color:#fff;
-    position:relative;
-    overflow:hidden;
-    margin-bottom:12px;
-  }
-  .topline:before{
-    content:"";
-    position:absolute;left:0;top:0;bottom:0;width:12px;
-    background:var(--brandRed);
-  }
+  .chip{display:inline-block;padding:8px 10px;border-radius:999px;border:1px solid rgba(225,29,72,.25);background:#fff;color:var(--text);font-size:12px;white-space:nowrap;}
+  .topline{border:1px solid var(--line);border-radius:16px;padding:12px 14px;background:linear-gradient(180deg,#0b1220,#0f1a33);color:#fff;position:relative;overflow:hidden;margin-bottom:12px;}
+  .topline:before{content:"";position:absolute;left:0;top:0;bottom:0;width:12px;background:var(--brandRed);}
   .h1{font-size:20px;font-weight:950;margin:0 0 4px 0}
   .meta{color:#e2e8f0;opacity:.95;font-size:12px}
-
   .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px}
   .twoCol{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
   .box{border:1px solid var(--line);border-radius:14px;padding:12px;background:#fff}
-  .secH{
-    font-size:13px;font-weight:950;margin:0 0 8px 0;color:var(--text);
-    padding-left:10px;
-    border-left:4px solid var(--brandRed);
-  }
+  .secH{font-size:13px;font-weight:950;margin:0 0 8px 0;color:var(--text);padding-left:10px;border-left:4px solid var(--brandRed);}
   .para{color:var(--muted);font-size:12px;line-height:1.6}
-
-  .pill{
-    display:flex;gap:10px;align-items:flex-start;
-    border:1px solid var(--line);
-    border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px
-  }
+  .pill{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px}
   .dot{width:10px;height:10px;border-radius:50%;margin-top:4px}
   .dot.ok{background:var(--ok)}
   .dot.warn{background:var(--warn)}
   .dot.bad{background:var(--bad)}
   .small{color:var(--muted);font-size:12px;line-height:1.5}
-
-  .table{
-    width:100%;
-    border-collapse:separate;border-spacing:0;
-    overflow:hidden;border-radius:14px;
-    border:1px solid rgba(15,23,42,.14);
-    margin-top:8px;
-  }
-  .table th,.table td{
-    padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);
-    font-size:12px;color:var(--text);background:#fff;
-  }
-  .table th{
-    background:var(--soft);text-align:left;
-  }
+  .table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border-radius:14px;border:1px solid rgba(15,23,42,.14);margin-top:8px;}
+  .table th,.table td{padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);font-size:12px;color:var(--text);background:#fff;}
+  .table th{background:var(--soft);text-align:left;}
   .table tr:last-child td{border-bottom:none}
 </style>
 </head>
@@ -453,7 +354,7 @@ function renderReportHtml(report) {
         <span class="dot ${market?.available ? 'ok' : 'warn'}"></span>
         <div>
           <div style="font-weight:950">Marktwert</div>
-          <div class="small">${escapeHtml(marketText)}</div>
+          <div class="small">${escapeHtml(market?.available ? 'Verfügbar' : `Nicht verfügbar (${market?.reason || 'keine Daten'})`)}</div>
         </div>
       </div>
 
@@ -525,75 +426,6 @@ function renderReportHtml(report) {
   </table>
 </div>
 
-<div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">FZB-24 Fahrzeugbericht</div>
-      <div class="sub">Technische Daten · VIN ${escapeHtml(report.vin)} · Report-ID ${escapeHtml(report.report_id)}</div>
-    </div>
-    <div class="chip">${escapeHtml(title || 'Fahrzeug')}</div>
-  </div>
-
-  <table class="table">
-    <thead><tr><th colspan="2">Technische Daten</th></tr></thead>
-    <tbody>
-      <tr><th style="width:42%">Länge</th><td>${escapeHtml(yesNoUnknown(v.length_mm))} mm</td></tr>
-      <tr><th>Breite</th><td>${escapeHtml(yesNoUnknown(v.width_mm))} mm</td></tr>
-      <tr><th>Höhe</th><td>${escapeHtml(yesNoUnknown(v.height_mm))} mm</td></tr>
-      <tr><th>Radstand</th><td>${escapeHtml(yesNoUnknown(v.wheelbase_mm))} mm</td></tr>
-      <tr><th>Leergewicht</th><td>${escapeHtml(yesNoUnknown(v.weight_empty_kg))} kg</td></tr>
-      <tr><th>Max. Gesamtgewicht</th><td>${escapeHtml(yesNoUnknown(v.max_weight_kg))} kg</td></tr>
-      <tr><th>Höchstgeschwindigkeit</th><td>${escapeHtml(yesNoUnknown(v.max_speed_kmh))} km/h</td></tr>
-      <tr><th>Reifengröße</th><td>${escapeHtml(yesNoUnknown(v.wheel_size))}</td></tr>
-      <tr><th>Vordere Bremsen</th><td>${escapeHtml(yesNoUnknown(v.brakes_front))}</td></tr>
-      <tr><th>Bremssystem</th><td>${escapeHtml(yesNoUnknown(v.brake_system))}</td></tr>
-      <tr><th>Lenkung</th><td>${escapeHtml(yesNoUnknown(v.steering_type))}</td></tr>
-      <tr><th>Federung</th><td>${escapeHtml(yesNoUnknown(v.suspension))}</td></tr>
-    </tbody>
-  </table>
-
-  <div class="small" style="margin-top:10px">
-    Tipp: Bei fehlenden Werten liefern die Datenquellen für dieses Modell/VIN keine Angaben.
-  </div>
-</div>
-
-<div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">FZB-24 Fahrzeugbericht</div>
-      <div class="sub">Hinweise & Datenquellen · VIN ${escapeHtml(report.vin)} · Report-ID ${escapeHtml(report.report_id)}</div>
-    </div>
-    <div class="chip">${escapeHtml(title || 'Fahrzeug')}</div>
-  </div>
-
-  <div class="box">
-    <div class="secH">Was dieser Bericht abdeckt</div>
-    <div class="para">
-      • Fahrzeugidentifikation und technische Fahrzeugdaten (VIN Decode)<br/>
-      • Diebstahlcheck basierend auf verfügbaren EU-Datenbanken<br/>
-      • Marktwert-Indikator, sofern ausreichende Marktdaten vorhanden sind
-    </div>
-  </div>
-
-  <div class="box" style="margin-top:12px">
-    <div class="secH">Wichtige Hinweise</div>
-    <div class="para">
-      • Dieser Bericht ist ein Informationsprodukt und ersetzt keine Vor-Ort-Prüfung.<br/>
-      • Es wird keine Garantie für Vollständigkeit, Unfallfreiheit oder Mängelfreiheit gegeben.<br/>
-      • Wenn einzelne Werte fehlen, lagen für dieses Fahrzeug keine Daten vor.
-    </div>
-  </div>
-
-  <div class="box" style="margin-top:12px">
-    <div class="secH">Disclaimer</div>
-    <div class="para">${escapeHtml(report.disclaimer)}</div>
-  </div>
-
-  <div class="small" style="margin-top:10px">
-    Erstellt am ${escapeHtml(new Date(report.generated_at).toLocaleString('de-DE'))}
-  </div>
-</div>
-
 </body>
 </html>`;
 }
@@ -621,19 +453,79 @@ async function renderPdfToFile(html, outPath) {
   }
 }
 
+// ===== Mail =====
+function makeTransporter() {
+  // Gmail SMTP
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+}
+
+async function sendReportMail({ to, vin, reportId, pdfPath, downloadUrl }) {
+  const subject = `FZB-24 Fahrzeugbericht – ${vin}`;
+  const text =
+`Hallo,
+
+anbei ist dein FZB-24 Fahrzeugbericht als PDF.
+
+VIN: ${vin}
+Report-ID: ${reportId}
+
+Backup-Download (falls dein Mail-Anhang blockiert wird):
+${downloadUrl}
+
+Viele Grüße
+FZB-24`;
+
+  const html =
+`<p>Hallo,</p>
+<p>anbei ist dein <b>FZB-24 Fahrzeugbericht</b> als PDF.</p>
+<p>
+<b>VIN:</b> ${escapeHtml(vin)}<br/>
+<b>Report-ID:</b> ${escapeHtml(reportId)}
+</p>
+<p style="color:#475569;font-size:13px">
+Backup-Download (falls der Mail-Anhang blockiert wird):<br/>
+<a href="${escapeHtml(downloadUrl)}">${escapeHtml(downloadUrl)}</a>
+</p>
+<p>Viele Grüße<br/>FZB-24</p>`;
+
+  const transporter = makeTransporter();
+  return transporter.sendMail({
+    from: `"FZB-24" <${SMTP_USER}>`,
+    to,
+    subject,
+    text,
+    html,
+    attachments: [
+      {
+        filename: `FZB24_${vin}.pdf`,
+        path: pdfPath,
+        contentType: 'application/pdf'
+      }
+    ]
+  });
+}
+
 // ===== Routes =====
 app.get('/', (_req, res) => res.send('✅ FZB-24 VIN Report API läuft'));
 
 app.get('/api/version', (_req, res) => {
+  // zeigt dir, welche Version gerade live ist
   res.json({ ok: true, build: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown' });
 });
 
+// Optionaler Download-Endpunkt (Backup-Link)
 app.get('/download/:token', (req, res) => {
   const item = getDownload(req.params.token);
   if (!item) return res.status(404).send('Link abgelaufen oder nicht gefunden.');
   return res.download(item.filePath);
 });
 
+// Preview wie gehabt
 app.get('/api/report/:vin', async (req, res) => {
   try {
     const built = await buildPreviewReport(req.params.vin);
@@ -656,7 +548,7 @@ app.get('/api/report/:vin', async (req, res) => {
   }
 });
 
-// (Optional) direkt Premium JSON
+// Debug/Intern: Premium JSON (ohne Mail)
 app.get('/api/premium-report/:vin', async (req, res) => {
   try {
     const built = await buildPremiumReport(req.params.vin, null);
@@ -668,12 +560,17 @@ app.get('/api/premium-report/:vin', async (req, res) => {
   }
 });
 
-// ALT (hat früher direkt PDF erstellt; lassen wir drin für Debug, aber NICHT mehr als finaler Checkout-Flow)
+/**
+ * (ALT) Direkter Test-Kauf ohne Wix:
+ * POST /api/order
+ * body: { vin, email }
+ * -> schickt Mail + PDF
+ */
 app.post('/api/order', async (req, res) => {
   try {
     const { vin, email } = req.body || {};
     if (!vin || typeof vin !== 'string') return res.status(400).json({ success: false, error: 'missing_vin' });
-    if (!email || typeof email !== 'string') return res.status(400).json({ success: false, error: 'missing_email' });
+    if (!email || typeof email !== 'string' || !email.includes('@')) return res.status(400).json({ success: false, error: 'missing_email' });
 
     const built = await buildPremiumReport(vin, email);
     if (!built.ok) return res.status(502).json({ success: false, ...built });
@@ -690,12 +587,22 @@ app.post('/api/order', async (req, res) => {
 
     const token = crypto.randomBytes(16).toString('hex');
     putDownload(token, filePath, { vin: report.vin, email });
+    const downloadUrl = `${PUBLIC_BASE_URL}/download/${token}`;
+
+    await sendReportMail({
+      to: email,
+      vin: report.vin,
+      reportId: report.report_id,
+      pdfPath: filePath,
+      downloadUrl
+    });
 
     return res.status(200).json({
       success: true,
-      status: 'done',
-      message: 'Danke! Dein Bericht wurde erstellt.',
-      download_url: `${PUBLIC_BASE_URL}/download/${token}`
+      status: 'emailed',
+      message: 'Bericht wurde per E-Mail versendet.',
+      // optional: wir geben den Link trotzdem zurück (Debug)
+      download_url: downloadUrl
     });
   } catch (err) {
     console.error('❌ Fehler /api/order:', err);
@@ -703,59 +610,54 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
-// ✅ 1) Wix Automation Endpoint: markiert Zahlung als eingegangen
-app.post('/api/order-from-wix', (req, res) => {
+/**
+ * Wix Automation Hook (nach erfolgreicher Zahlung)
+ * POST /api/order-from-wix
+ *
+ * body:
+ * {
+ *   "secret": "...",               // muss WEBHOOK_SECRET matchen
+ *   "purchaseFlowId": "....",      // Order/Payment ID o.Ä. (für Idempotenz)
+ *   "email": "kunde@...",
+ *   "vin": "WBA...."
+ * }
+ */
+app.post('/api/order-from-wix', async (req, res) => {
   try {
-    const body = req.body || {};
-    const purchaseFlowId = String(body.purchaseFlowId || '').trim();
-    const email = String(body.email || '').trim().toLowerCase();
-    const vin = body.vin ? sanitizeVin(body.vin) : '';
+    const { secret, purchaseFlowId, email, vin } = req.body || {};
 
-    if (!purchaseFlowId) {
+    if (WEBHOOK_SECRET) {
+      if (!secret || secret !== WEBHOOK_SECRET) {
+        return res.status(401).json({ success: false, error: 'unauthorized' });
+      }
+    }
+
+    if (!purchaseFlowId || typeof purchaseFlowId !== 'string') {
       return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
     }
-    if (!email || !email.includes('@')) {
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ success: false, error: 'missing_email' });
     }
+    if (!vin || typeof vin !== 'string') {
+      return res.status(400).json({ success: false, error: 'missing_vin' });
+    }
 
-    // Zahlung merken (persistiert)
-    markPaid(purchaseFlowId, email);
-
-    return res.status(200).json({
-      success: true,
-      received: { purchaseFlowId, email, vin: vin || null },
-      next: 'Now call /api/fulfill with purchaseFlowId + vin + email (from thank-you page)'
-    });
-  } catch (e) {
-    console.error('❌ /api/order-from-wix error:', e);
-    return res.status(500).json({ success: false, error: 'server_error', details: e.message });
-  }
-});
-
-// ✅ 2) Danke-Seite Endpoint: erstellt PDF nur wenn Zahlung vorhanden ist
-app.post('/api/fulfill', async (req, res) => {
-  try {
-    const { purchaseFlowId, vin, email } = req.body || {};
-    const pf = String(purchaseFlowId || '').trim();
-    const v = sanitizeVin(vin);
-    const em = String(email || '').trim().toLowerCase();
-
-    if (!pf) return res.status(400).json({ success: false, error: 'missing_purchaseFlowId' });
-    if (!v || v.length < 11) return res.status(400).json({ success: false, error: 'missing_or_invalid_vin' });
-    if (!em || !em.includes('@')) return res.status(400).json({ success: false, error: 'missing_email' });
-
-    // Payment check
-    if (!isPaid(pf, em)) {
-      return res.status(403).json({
-        success: false,
-        error: 'not_paid',
-        message: 'Zahlung noch nicht bestätigt. Bitte 10-30 Sekunden warten und Seite neu laden.'
+    // Idempotenz: wenn Wix Automation doppelt feuert
+    if (processedFlows.has(purchaseFlowId)) {
+      return res.status(200).json({
+        success: true,
+        status: 'already_processed',
+        purchaseFlowId
       });
     }
 
-    // Report bauen + PDF erzeugen
-    const built = await buildPremiumReport(v, em);
-    if (!built.ok) return res.status(502).json({ success: false, ...built });
+    processedFlows.set(purchaseFlowId, { at: Date.now(), status: 'processing' });
+
+    const built = await buildPremiumReport(vin, email);
+    if (!built.ok) {
+      processedFlows.set(purchaseFlowId, { at: Date.now(), status: 'failed', error: built.error });
+      return res.status(502).json({ success: false, ...built });
+    }
 
     const report = built.report;
     const html = renderReportHtml(report);
@@ -768,17 +670,32 @@ app.post('/api/fulfill', async (req, res) => {
     await renderPdfToFile(html, filePath);
 
     const token = crypto.randomBytes(16).toString('hex');
-    putDownload(token, filePath, { vin: report.vin, email: em, purchaseFlowId: pf });
+    putDownload(token, filePath, { vin: report.vin, email, purchaseFlowId });
+    const downloadUrl = `${PUBLIC_BASE_URL}/download/${token}`;
+
+    await sendReportMail({
+      to: email,
+      vin: report.vin,
+      reportId: report.report_id,
+      pdfPath: filePath,
+      downloadUrl
+    });
+
+    processedFlows.set(purchaseFlowId, {
+      at: Date.now(),
+      status: 'emailed',
+      report_id: report.report_id
+    });
 
     return res.status(200).json({
       success: true,
-      status: 'done',
-      message: 'Bericht erstellt.',
-      download_url: `${PUBLIC_BASE_URL}/download/${token}`
+      status: 'emailed',
+      purchaseFlowId,
+      report_id: report.report_id
     });
-  } catch (e) {
-    console.error('❌ /api/fulfill error:', e);
-    return res.status(500).json({ success: false, error: 'server_error', details: e.message });
+  } catch (err) {
+    console.error('❌ Fehler /api/order-from-wix:', err);
+    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
   }
 });
 
