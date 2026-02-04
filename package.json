@@ -15,7 +15,7 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "node-fetch": "^3.3.2",
-    "nodemailer": "^7.0.13",
+    "nodemailer": "^6.9.14",
     "puppeteer-core": "^24.36.1"
   }
 }
