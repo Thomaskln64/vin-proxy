@@ -622,6 +622,14 @@ function extractVinFromOrder(order, fallbackBody) {
 }
 
 // ===== Routes =====
+app.post('/api/_debug/echo', (req, res) => {
+  return res.status(200).json({
+    ok: true,
+    headers: req.headers,
+    body: req.body
+  });
+});
+
 app.get('/', (_req, res) => res.send('✅ FZB-24 VIN Report API läuft'));
 
 app.get('/api/version', (_req, res) => {
