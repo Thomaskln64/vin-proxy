@@ -635,14 +635,40 @@ function extractEmailFromOrder(order, payload) {
   return email ? String(email).trim() : null;
 }
 
-function extractVinFromOrder(order, payload) {
-  // 0) Wenn Payload direkt vin liefert (Test)
-  const direct = payload?.vin || payload?.data?.vin;
-  if (direct && isLikelyVin(direct)) return sanitizeVin(direct);
-
+function extractVinFromOrder(order) {
   if (!order) return null;
 
-  // 1) lineItems[].customTextFields[] (wenn du es dort hast)
+  // 0) ✅ Wix "custom checkout field" landet bei dir hier:
+  // order.extendedFields.namespaces._user_fields.{fahrgestellnummer_fin_1: "..."}
+  const userFields =
+    order?.extendedFields?.namespaces?._user_fields ||
+    order?.extended_fields?.namespaces?._user_fields ||
+    null;
+
+  if (userFields && typeof userFields === 'object') {
+    for (const [k, v] of Object.entries(userFields)) {
+      if (!v) continue;
+      const key = String(k || '').toLowerCase();
+      const val = String(v || '').trim();
+      if (!val) continue;
+
+      // akzeptiere viele Key-Varianten
+      if (
+        key.includes('vin') ||
+        key.includes('fin') ||
+        key.includes('fahrgestell') ||
+        key.includes('fahrgestellnummer')
+      ) {
+        return sanitizeVin(val);
+      }
+
+      // falls Key nicht passt, aber Value sieht nach VIN aus:
+      const s = sanitizeVin(val);
+      if (s.length >= 11 && s.length <= 17) return s;
+    }
+  }
+
+  // 1) lineItems[].customTextFields[]
   const lineItems = order.lineItems || order.line_items || [];
   for (const li of lineItems) {
     const ctf = li.customTextFields || li.custom_text_fields || li.customTextField || [];
@@ -651,67 +677,28 @@ function extractVinFromOrder(order, payload) {
         const title = String(f?.title || f?.name || '').toLowerCase();
         const value = f?.value;
         if (!value) continue;
-        const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
-        if (hits.some(h => title.includes(h)) && isLikelyVin(value)) return sanitizeVin(value);
+
+        const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
+        if (hits.some(h => title.includes(h))) return sanitizeVin(value);
       }
     }
   }
 
-  // 2) order.extendedFields.namespaces._user_fields.<irgendwas> = VIN (das ist bei dir der Standard!)
-  const namespaces = order?.extendedFields?.namespaces || order?.extended_fields?.namespaces || null;
-  if (namespaces && typeof namespaces === 'object') {
-    // a) explizit _user_fields
-    const uf = namespaces._user_fields;
-    if (uf && typeof uf === 'object') {
-      for (const [k, v] of Object.entries(uf)) {
-        const key = String(k).toLowerCase();
-        if (key.includes('vin') || key.includes('fin') || key.includes('fahrgestell')) {
-          if (isLikelyVin(v)) return sanitizeVin(v);
-        }
-      }
-      // falls der Key nicht VIN/FIN enthält, trotzdem alles prüfen:
-      for (const v of Object.values(uf)) {
-        if (isLikelyVin(v)) return sanitizeVin(v);
-      }
-    }
-
-    // b) alle namespaces durchsuchen (falls Wix anders benennt)
-    for (const nsVal of Object.values(namespaces)) {
-      if (!nsVal || typeof nsVal !== 'object') continue;
-      for (const [k, v] of Object.entries(nsVal)) {
-        const key = String(k).toLowerCase();
-        if (key.includes('vin') || key.includes('fin') || key.includes('fahrgestell')) {
-          if (isLikelyVin(v)) return sanitizeVin(v);
-        }
-      }
-      for (const v of Object.values(nsVal)) {
-        if (isLikelyVin(v)) return sanitizeVin(v);
-      }
-    }
-  }
-
-  // 3) order.customFields / order.customTextFields (anderer Wix-Fall)
-  const any = order.customFields || order.customTextFields || order.custom_fields || [];
+  // 2) fallback: order.customFields / customTextFields
+  const any = order.customFields || order.customTextFields || [];
   if (Array.isArray(any)) {
     for (const f of any) {
       const title = String(f?.title || f?.name || '').toLowerCase();
       const value = f?.value;
       if (!value) continue;
       const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
-      if (hits.some(h => title.includes(h)) && isLikelyVin(value)) return sanitizeVin(value);
-    }
-  }
-
-  // 4) als letzte Rettung: payload.data.order.extendedFields (manchmal verschachtelt)
-  const deep = payload?.data?.order?.extendedFields?.namespaces?._user_fields;
-  if (deep && typeof deep === 'object') {
-    for (const v of Object.values(deep)) {
-      if (isLikelyVin(v)) return sanitizeVin(v);
+      if (hits.some(h => title.includes(h))) return sanitizeVin(value);
     }
   }
 
   return null;
 }
+
 
 // ====================== SECURITY + IDEMPOTENCY ======================
 
@@ -815,7 +802,13 @@ app.post('/api/order-from-wix', async (req, res) => {
       });
     }
 
-    const email = extractEmailFromOrder(order, payload);
+    const email =
+  extractEmailFromOrder(order) ||
+  payload?.data?.contact?.email ||
+  payload?.contact?.email ||
+  payload?.email ||
+  null;
+
     const vinRaw = extractVinFromOrder(order, payload);
     const vin = vinRaw ? sanitizeVin(vinRaw) : '';
 
