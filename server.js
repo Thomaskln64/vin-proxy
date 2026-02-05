@@ -593,10 +593,77 @@ async function renderPdfToFile(html, outPath) {
 // ====================== WIX PAYLOAD PARSER ======================
 
 // ✅ VIN aus vielen möglichen Feldern (inkl. extendedFields user_fields)
-function extractVinFromOrder(order) {
+function looksLikeVin(str) {
+  if (!str) return false;
+  const s = String(str).trim().toUpperCase();
+  // VIN enthält nie I, O, Q
+  if (/[IOQ]/.test(s)) return false;
+  // meistens 17 Zeichen, wir erlauben 11-25 als "weich" und prüfen später nochmal
+  return /^[A-HJ-NPR-Z0-9]{11,25}$/.test(s);
+}
+
+function extractVinStringFromAnyValue(val) {
+  if (val === null || val === undefined) return null;
+
+  // Wenn Wix statt String ein Objekt speichert: { value: "WBA..." }
+  if (typeof val === 'object') {
+    if (typeof val.value === 'string' && looksLikeVin(val.value)) return sanitizeVin(val.value);
+    if (typeof val.text === 'string' && looksLikeVin(val.text)) return sanitizeVin(val.text);
+    if (typeof val.data === 'string' && looksLikeVin(val.data)) return sanitizeVin(val.data);
+  }
+
+  if (typeof val === 'string') {
+    // manchmal steckt die VIN in einem längeren String -> VIN Pattern rausschneiden
+    const up = val.toUpperCase();
+    const m = up.match(/([A-HJ-NPR-Z0-9]{17})/); // harte 17er VIN im Text
+    if (m && looksLikeVin(m[1])) return sanitizeVin(m[1]);
+    if (looksLikeVin(up)) return sanitizeVin(up);
+  }
+
+  return null;
+}
+
+function deepFindVin(obj) {
+  // Tiefensuche (Fallback): findet VIN irgendwo im Objektbaum
+  const seen = new Set();
+  const stack = [obj];
+
+  while (stack.length) {
+    const cur = stack.pop();
+    if (!cur || typeof cur !== 'object') continue;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+
+    for (const [k, v] of Object.entries(cur)) {
+      const key = String(k || '').toLowerCase();
+
+      // erst: Felder, die vom Key her sehr wahrscheinlich VIN sind
+      const keyHints = ['vin', 'fin', 'fahrgestell', 'fahrgestellnummer', 'vehicle'];
+      if (keyHints.some(h => key.includes(h))) {
+        const vin = extractVinStringFromAnyValue(v);
+        if (vin) return vin;
+      }
+
+      // dann: Wert prüfen
+      const vin2 = extractVinStringFromAnyValue(v);
+      if (vin2) return vin2;
+
+      // weiter runter
+      if (v && typeof v === 'object') stack.push(v);
+    }
+  }
+
+  return null;
+}
+
+// ✅ Neue robuste Version (nimmt order + optional payload)
+function extractVinFromOrder(order, payload = null) {
+  if (!order && payload) {
+    return deepFindVin(payload);
+  }
   if (!order) return null;
 
-  // 0) Extended fields (Wix "Custom checkout field" landet oft hier)
+  // 1) extendedFields._user_fields (dein Beispiel: fahrgestellnummer_fin_1)
   const userFields =
     order?.extendedFields?.namespaces?._user_fields ||
     order?.extended_fields?.namespaces?._user_fields ||
@@ -605,17 +672,18 @@ function extractVinFromOrder(order) {
   if (userFields && typeof userFields === 'object') {
     for (const [k, v] of Object.entries(userFields)) {
       const key = String(k || '').toLowerCase();
-      if (!v) continue;
-
       const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
       if (hits.some(h => key.includes(h))) {
-        const sv = sanitizeVin(v);
-        if (sv && sv.length >= 8) return sv;
+        const vin = extractVinStringFromAnyValue(v);
+        if (vin) return vin;
       }
     }
+    // falls Keys nicht passen: trotzdem VIN suchen
+    const anyVin = deepFindVin(userFields);
+    if (anyVin) return anyVin;
   }
 
-  // 1) lineItems[].customTextFields[]
+  // 2) lineItems[].customTextFields[]
   const lineItems = order.lineItems || order.line_items || [];
   for (const li of lineItems) {
     const ctf = li.customTextFields || li.custom_text_fields || li.customTextField || [];
@@ -627,14 +695,14 @@ function extractVinFromOrder(order) {
 
         const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
         if (hits.some(h => title.includes(h))) {
-          const sv = sanitizeVin(value);
-          if (sv && sv.length >= 8) return sv;
+          const vin = extractVinStringFromAnyValue(value);
+          if (vin) return vin;
         }
       }
     }
   }
 
-  // 2) fallback: order.customFields / customTextFields
+  // 3) order.customFields / order.customTextFields
   const any = order.customFields || order.customTextFields || [];
   if (Array.isArray(any)) {
     for (const f of any) {
@@ -643,10 +711,20 @@ function extractVinFromOrder(order) {
       if (!value) continue;
       const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
       if (hits.some(h => title.includes(h))) {
-        const sv = sanitizeVin(value);
-        if (sv && sv.length >= 8) return sv;
+        const vin = extractVinStringFromAnyValue(value);
+        if (vin) return vin;
       }
     }
+  }
+
+  // 4) Fallback: tief im Order-Objekt suchen
+  const fallbackVin = deepFindVin(order);
+  if (fallbackVin) return fallbackVin;
+
+  // 5) Fallback: wenn payload mitgegeben wurde, dort suchen
+  if (payload) {
+    const payloadVin = deepFindVin(payload);
+    if (payloadVin) return payloadVin;
   }
 
   return null;
@@ -799,7 +877,10 @@ app.post('/api/order-from-wix', async (req, res) => {
     }
 
     const email = extractEmailFromOrder(order) || payload.email || null;
-    const vin = sanitizeVin(extractVinFromOrder(order) || payload.vin || '');
+    const vin = sanitizeVin(extractVinFromOrder(order, payload) || payload.vin || '');
+    log('🔎 VIN check: raw found =', extractVinFromOrder(order, payload));
+    log('🔎 Order has extendedFields =', !!(order && (order.extendedFields || order.extended_fields)));
+
 
     log('📦 Incoming purchaseFlowId:', purchaseFlowId);
     log('📧 email:', email);
