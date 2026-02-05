@@ -657,78 +657,68 @@ function deepFindVin(obj) {
 }
 
 // ✅ Neue robuste Version (nimmt order + optional payload)
-function extractVinFromOrder(order, payload = null) {
-  if (!order && payload) {
-    return deepFindVin(payload);
-  }
+function extractVinFromOrder(order) {
   if (!order) return null;
 
-  // 1) extendedFields._user_fields (dein Beispiel: fahrgestellnummer_fin_1)
+  // 0) Wix "extendedFields" (dein Fall!)
+  // Beispiel aus deinem Payload:
+  // order.extendedFields.namespaces._user_fields.fahrgestellnummer_fin_1 = "wba3t..."
   const userFields =
     order?.extendedFields?.namespaces?._user_fields ||
     order?.extended_fields?.namespaces?._user_fields ||
     null;
 
-  if (userFields && typeof userFields === 'object') {
+  if (userFields && typeof userFields === "object") {
+    // Suche nach Keys, die nach VIN/FIN klingen
     for (const [k, v] of Object.entries(userFields)) {
-      const key = String(k || '').toLowerCase();
-      const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
-      if (hits.some(h => key.includes(h))) {
-        const vin = extractVinStringFromAnyValue(v);
-        if (vin) return vin;
-      }
+      const key = String(k || "").toLowerCase();
+      const val = String(v || "").trim();
+      if (!val) continue;
+
+      const hits = ["vin", "fin", "fahrgestell", "fahrgestellnummer"];
+      if (hits.some(h => key.includes(h))) return sanitizeVin(val);
+
+      // Extra: wenn der Wert wie eine VIN aussieht, nimm ihn
+      if (/^[A-HJ-NPR-Z0-9]{11,25}$/i.test(val)) return sanitizeVin(val);
     }
-    // falls Keys nicht passen: trotzdem VIN suchen
-    const anyVin = deepFindVin(userFields);
-    if (anyVin) return anyVin;
   }
 
-  // 2) lineItems[].customTextFields[]
+  // 1) lineItems[].customTextFields[] (falls du das später doch nutzt)
   const lineItems = order.lineItems || order.line_items || [];
   for (const li of lineItems) {
-    const ctf = li.customTextFields || li.custom_text_fields || li.customTextField || [];
+    const ctf = li.customTextFields || li.custom_text_fields || [];
     if (Array.isArray(ctf)) {
       for (const f of ctf) {
         const title = String(f?.title || f?.name || '').toLowerCase();
-        const value = f?.value;
+        const value = String(f?.value || '').trim();
         if (!value) continue;
 
         const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
-        if (hits.some(h => title.includes(h))) {
-          const vin = extractVinStringFromAnyValue(value);
-          if (vin) return vin;
-        }
+        if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+
+        if (/^[A-HJ-NPR-Z0-9]{11,25}$/i.test(value)) return sanitizeVin(value);
       }
     }
   }
 
-  // 3) order.customFields / order.customTextFields
+  // 2) fallback: order.customFields / customTextFields
   const any = order.customFields || order.customTextFields || [];
   if (Array.isArray(any)) {
     for (const f of any) {
       const title = String(f?.title || f?.name || '').toLowerCase();
-      const value = f?.value;
+      const value = String(f?.value || '').trim();
       if (!value) continue;
+
       const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
-      if (hits.some(h => title.includes(h))) {
-        const vin = extractVinStringFromAnyValue(value);
-        if (vin) return vin;
-      }
+      if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+
+      if (/^[A-HJ-NPR-Z0-9]{11,25}$/i.test(value)) return sanitizeVin(value);
     }
-  }
-
-  // 4) Fallback: tief im Order-Objekt suchen
-  const fallbackVin = deepFindVin(order);
-  if (fallbackVin) return fallbackVin;
-
-  // 5) Fallback: wenn payload mitgegeben wurde, dort suchen
-  if (payload) {
-    const payloadVin = deepFindVin(payload);
-    if (payloadVin) return payloadVin;
   }
 
   return null;
 }
+
 
 function extractEmailFromOrder(order) {
   if (!order) return null;
