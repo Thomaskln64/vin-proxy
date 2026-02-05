@@ -11,46 +11,61 @@ const chromium = require('@sparticuz/chromium');
 const nodemailer = require('nodemailer');
 
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+// ====================== ENV ======================
 const PORT = process.env.PORT || 3001;
 
 const API_VERSION = '3.2';
 const VINCARIO_BASE_URL = `https://api.vincario.com/${API_VERSION}`;
-
 const VINCARIO_API_KEY = process.env.VINCARIO_API_KEY;
 const VINCARIO_SECRET_KEY = process.env.VINCARIO_SECRET_KEY;
 
 const DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
 
-const EMAIL_ENABLED = (process.env.EMAIL_ENABLED || 'false').toLowerCase() === 'true';
-const MAIL_FROM = process.env.MAIL_FROM || 'FZB-24 <fzb24.info@gmail.com>';
+// PDF / Email
+const PDF_ENABLED = (process.env.PDF_ENABLED || 'true').toLowerCase() === 'true';
+const EMAIL_ENABLED = (process.env.EMAIL_ENABLED || 'true').toLowerCase() === 'true';
 
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_SECURE = (process.env.SMTP_SECURE || 'true').toLowerCase() === 'true';
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_USER = process.env.SMTP_USER; // fzb24.info@gmail.com
+const SMTP_PASS = process.env.SMTP_PASS; // App password
+const MAIL_FROM = process.env.MAIL_FROM || `FZB-24 <${SMTP_USER}>`;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || SMTP_USER;
 
+// Webhook security
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
-const REPORTS_DIR = path.join(__dirname, 'reports');
-
-// Render erkennt man oft über NODE_ENV=production, alternativ kannst du RENDER=true setzen
+// Render prod detection
 const IS_PROD =
   (process.env.NODE_ENV || '').toLowerCase() === 'production' ||
   (process.env.RENDER || '').toLowerCase() === 'true';
 
 if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
-  console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in environment');
+  console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in env');
   process.exit(1);
 }
 
+if (EMAIL_ENABLED) {
+  if (!SMTP_USER || !SMTP_PASS) {
+    console.error('❌ EMAIL_ENABLED=true but SMTP_USER/SMTP_PASS missing');
+    process.exit(1);
+  }
+}
+
+// Render: nutze /tmp (stabil, schnell, kein Repo-Ordner)
+const REPORTS_DIR = path.join('/tmp', 'reports');
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+// ====================== UTIL ======================
+function log(...args) {
+  if (DEBUG) console.log(...args);
+}
 
-// ===== Helpers =====
 function sanitizeVin(vin) {
   return String(vin || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 25);
 }
@@ -94,7 +109,7 @@ async function vincarioGet(vin, action) {
   const v = sanitizeVin(vin);
   const controlSum = makeControlSum(v, action);
   const url = `${VINCARIO_BASE_URL}/${VINCARIO_API_KEY}/${controlSum}/${action}/${v}.json`;
-  if (DEBUG) console.log('🔗 Vincario:', url);
+  log('🔗 Vincario:', url);
   return await getJson(url);
 }
 
@@ -143,167 +158,51 @@ function makeReportId(vin) {
   return crypto.createHash('sha1').update(`${vin}|${day}`).digest('hex').substring(0, 10).toUpperCase();
 }
 
-// ===== Wix payload extraction =====
-function deepFindEmail(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-
-  // common Wix spots
-  const direct =
-    obj?.email ||
-    obj?.buyerInfo?.email ||
-    obj?.billingInfo?.email ||
-    obj?.contactInfo?.email ||
-    obj?.recipientInfo?.email;
-
-  if (typeof direct === 'string' && direct.includes('@')) return direct.trim();
-
-  // scan shallow keys
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (typeof v === 'string' && v.includes('@')) return v.trim();
+function safeJson(obj, maxLen = 4000) {
+  let s = '';
+  try {
+    s = JSON.stringify(obj, null, 2);
+  } catch {
+    s = String(obj);
   }
-
-  // recurse
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (v && typeof v === 'object') {
-      const found = deepFindEmail(v);
-      if (found) return found;
-    }
-  }
-  return null;
+  if (s.length > maxLen) s = s.slice(0, maxLen) + '\n…(gekürzt)…';
+  return s;
 }
 
-function extractVinFromOrder(order) {
-  if (!order || typeof order !== 'object') return null;
+// ====================== EMAIL ======================
+let mailer = null;
 
-  // 1) customTextFields in lineItems
-  const items = order?.lineItems;
-  if (Array.isArray(items)) {
-    for (const it of items) {
-      const ctf = it?.customTextFields;
-      if (Array.isArray(ctf)) {
-        const hit = ctf.find(x => {
-          const t = String(x?.title || '').toLowerCase();
-          return t === 'vin' || t === 'fin' || t.includes('fahrgestell');
-        });
-        if (hit?.value) return sanitizeVin(hit.value);
-      }
-    }
-  }
+function getMailer() {
+  if (!EMAIL_ENABLED) return null;
+  if (mailer) return mailer;
 
-  // 2) customFields (some Wix setups)
-  const cf = order?.customFields;
-  if (Array.isArray(cf)) {
-    const hit = cf.find(x => {
-      const n = String(x?.name || '').toLowerCase();
-      return n === 'vin' || n === 'fin';
-    });
-    if (hit?.value) return sanitizeVin(hit.value);
-  }
-
-  // 3) last resort: search any string that looks like VIN (>= 11 alnum)
-  const stack = [order];
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur) continue;
-    if (typeof cur === 'string') {
-      const s = sanitizeVin(cur);
-      if (s.length >= 11) return s;
-      continue;
-    }
-    if (Array.isArray(cur)) {
-      for (const x of cur) stack.push(x);
-      continue;
-    }
-    if (typeof cur === 'object') {
-      for (const k of Object.keys(cur)) stack.push(cur[k]);
-    }
-  }
-
-  return null;
-}
-
-function parseWixPayload(body) {
-  // We accept:
-  // A) simplified test payload { purchaseFlowId, email, vin }
-  // B) Wix full payload where order is at body.order or body.data.order etc.
-  const purchaseFlowId =
-    body?.purchaseFlowId ||
-    body?.payment?.purchaseFlowId ||
-    body?.payment?.id ||
-    body?.order?.purchaseFlowId ||
-    body?.order?.id ||
-    body?.data?.order?.id ||
-    body?.eventId ||
-    null;
-
-  const order =
-    body?.order ||
-    body?.data?.order ||
-    body?.payload?.order ||
-    body?.event?.order ||
-    null;
-
-  const email = (typeof body?.email === 'string' && body.email.includes('@'))
-    ? body.email.trim()
-    : deepFindEmail(order) || deepFindEmail(body);
-
-  const vin = body?.vin
-    ? sanitizeVin(body.vin)
-    : extractVinFromOrder(order) || (body?.vinDetected ? sanitizeVin(body.vinDetected) : null);
-
-  return { purchaseFlowId, email, vin, order };
-}
-
-// ===== Mailer =====
-function makeTransport() {
-  if (!SMTP_USER || !SMTP_PASS) return null;
-
-  return nodemailer.createTransport({
+  mailer = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_SECURE,
     auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
+
+  return mailer;
 }
 
-async function sendPdfEmail({ to, vin, reportId, pdfPath }) {
-  if (!EMAIL_ENABLED) {
-    return { ok: false, skipped: true, reason: 'EMAIL_ENABLED=false' };
-  }
+async function sendMail({ to, subject, text, html, attachments = [] }) {
+  if (!EMAIL_ENABLED) return { skipped: true };
 
-  const transport = makeTransport();
-  if (!transport) {
-    return { ok: false, skipped: true, reason: 'SMTP creds missing' };
-  }
-
-  const subject = `Dein FZB-24 Fahrzeugbericht (${vin})`;
-  const text =
-`Hallo,
-
-anbei ist dein Fahrzeugbericht als PDF.
-
-VIN: ${vin}
-Report-ID: ${reportId}
-
-Danke für deinen Kauf.
-FZB-24`;
-
-  await transport.sendMail({
+  const transporter = getMailer();
+  const info = await transporter.sendMail({
     from: MAIL_FROM,
     to,
     subject,
     text,
-    attachments: [
-      { filename: `FZB24_${vin}_${reportId}.pdf`, path: pdfPath }
-    ]
+    html,
+    attachments
   });
 
-  return { ok: true };
+  return info;
 }
 
-// ===== Report Builders =====
+// ====================== REPORT BUILDERS ======================
 async function buildPreviewReport(vin) {
   const decodeR = await vincarioGet(vin, 'decode');
   if (!decodeR.ok || !decodeR.json?.decode) {
@@ -386,19 +285,19 @@ async function buildPremiumReport(vin, email = null) {
     vin_decode_raw: stripInternalFields(decodeR.json),
     generated_at: new Date().toISOString(),
     disclaimer:
-      'Informationsbericht auf Basis verfügbarer Datenquellen. Keine Garantie für Vollständigkeit oder tatsächlichen Fahrzeugzustand.'
+      'Informationsbericht auf Basis verfügbarer Datenquellen. Keine Garantie für Vollständigkeit, Richtigkeit oder tatsächlichen Zustand des Fahrzeugs.'
   };
 
   return { ok: true, report };
 }
 
-// ===== HTML Report =====
+// ====================== HTML REPORT ======================
 function renderReportHtml(report) {
   const v = report.vehicle || {};
   const stolenStatus = report.checks?.stolen?.status || 'unknown';
   const market = report.checks?.market_value;
 
-  let verdict = { label: 'Hinweis', color: 'warn', text: 'Bericht dient zur Orientierung. Bitte immer zusätzlich vor Ort prüfen.' };
+  let verdict = { label: 'Hinweis', color: 'warn', text: 'Keine vollständige Historie verfügbar. Bericht dient zur Orientierung.' };
   if (stolenStatus === 'not-stolen') verdict = { label: 'OK', color: 'ok', text: 'Kein Treffer im EU-Diebstahlcheck gefunden.' };
   if (stolenStatus === 'stolen') verdict = { label: 'Achtung', color: 'bad', text: 'Treffer im Diebstahlcheck. Bitte unbedingt prüfen.' };
 
@@ -430,17 +329,14 @@ function renderReportHtml(report) {
   body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);background:#fff}
   .page{padding:22px 24px;page-break-after:always}
   .page:last-child{page-break-after:auto}
-
   .header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
   .brand{font-weight:950;font-size:18px;color:var(--text)}
   .sub{color:var(--muted);font-size:12px;margin-top:3px;line-height:1.4}
-
   .chip{
     display:inline-block;padding:8px 10px;border-radius:999px;
     border:1px solid rgba(225,29,72,.25);
-    background:#fff;color:var(--text);font-size:12px;white-space:nowrap;
+    color:var(--text);font-size:12px;white-space:nowrap;
   }
-
   .topline{
     border:1px solid var(--line);
     border-radius:16px;
@@ -451,48 +347,21 @@ function renderReportHtml(report) {
     overflow:hidden;
     margin-bottom:12px;
   }
-  .topline:before{
-    content:"";
-    position:absolute;left:0;top:0;bottom:0;width:12px;
-    background:var(--brandRed);
-  }
+  .topline:before{content:"";position:absolute;left:0;top:0;bottom:0;width:12px;background:var(--brandRed);}
   .h1{font-size:20px;font-weight:950;margin:0 0 4px 0}
   .meta{color:#e2e8f0;opacity:.95;font-size:12px}
-
   .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:12px}
   .twoCol{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-
   .box{border:1px solid var(--line);border-radius:14px;padding:12px;background:#fff}
-  .secH{
-    font-size:13px;font-weight:950;margin:0 0 8px 0;color:var(--text);
-    padding-left:10px;
-    border-left:4px solid var(--brandRed);
-  }
+  .secH{font-size:13px;font-weight:950;margin:0 0 8px 0;color:var(--text);padding-left:10px;border-left:4px solid var(--brandRed);}
   .para{color:var(--muted);font-size:12px;line-height:1.6}
-
-  .pill{
-    display:flex;gap:10px;align-items:flex-start;
-    border:1px solid var(--line);
-    border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px
-  }
+  .pill{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:14px;padding:10px 12px;background:#fff;margin-bottom:10px}
   .dot{width:10px;height:10px;border-radius:50%;margin-top:4px}
-  .dot.ok{background:var(--ok)}
-  .dot.warn{background:var(--warn)}
-  .dot.bad{background:var(--bad)}
+  .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
   .small{color:var(--muted);font-size:12px;line-height:1.5}
-
-  .table{
-    width:100%;
-    border-collapse:separate;border-spacing:0;
-    overflow:hidden;border-radius:14px;
-    border:1px solid rgba(15,23,42,.14);
-    margin-top:8px;
-  }
-  .table th,.table td{
-    padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);
-    font-size:12px;color:var(--text);background:#fff;
-  }
-  .table th{background:var(--soft);text-align:left}
+  .table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border-radius:14px;border:1px solid rgba(15,23,42,.14);margin-top:8px;}
+  .table th,.table td{padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.08);font-size:12px;color:var(--text);background:#fff;}
+  .table th{background:var(--soft);text-align:left;}
   .table tr:last-child td{border-bottom:none}
 </style>
 </head>
@@ -625,11 +494,80 @@ function renderReportHtml(report) {
   </table>
 </div>
 
+<div class="page">
+  <div class="header">
+    <div>
+      <div class="brand">FZB-24 Fahrzeugbericht</div>
+      <div class="sub">Technische Daten · VIN ${escapeHtml(report.vin)} · Report-ID ${escapeHtml(report.report_id)}</div>
+    </div>
+    <div class="chip">${escapeHtml(title || 'Fahrzeug')}</div>
+  </div>
+
+  <table class="table">
+    <thead><tr><th colspan="2">Technische Daten</th></tr></thead>
+    <tbody>
+      <tr><th style="width:42%">Länge</th><td>${escapeHtml(yesNoUnknown(v.length_mm))} mm</td></tr>
+      <tr><th>Breite</th><td>${escapeHtml(yesNoUnknown(v.width_mm))} mm</td></tr>
+      <tr><th>Höhe</th><td>${escapeHtml(yesNoUnknown(v.height_mm))} mm</td></tr>
+      <tr><th>Radstand</th><td>${escapeHtml(yesNoUnknown(v.wheelbase_mm))} mm</td></tr>
+      <tr><th>Leergewicht</th><td>${escapeHtml(yesNoUnknown(v.weight_empty_kg))} kg</td></tr>
+      <tr><th>Max. Gesamtgewicht</th><td>${escapeHtml(yesNoUnknown(v.max_weight_kg))} kg</td></tr>
+      <tr><th>Höchstgeschwindigkeit</th><td>${escapeHtml(yesNoUnknown(v.max_speed_kmh))} km/h</td></tr>
+      <tr><th>Reifengröße</th><td>${escapeHtml(yesNoUnknown(v.wheel_size))}</td></tr>
+      <tr><th>Vordere Bremsen</th><td>${escapeHtml(yesNoUnknown(v.brakes_front))}</td></tr>
+      <tr><th>Bremssystem</th><td>${escapeHtml(yesNoUnknown(v.brake_system))}</td></tr>
+      <tr><th>Lenkung</th><td>${escapeHtml(yesNoUnknown(v.steering_type))}</td></tr>
+      <tr><th>Federung</th><td>${escapeHtml(yesNoUnknown(v.suspension))}</td></tr>
+    </tbody>
+  </table>
+
+  <div class="small" style="margin-top:10px">
+    Tipp: Bei fehlenden Werten liefern die Datenquellen für dieses Modell/VIN keine Angaben.
+  </div>
+</div>
+
+<div class="page">
+  <div class="header">
+    <div>
+      <div class="brand">FZB-24 Fahrzeugbericht</div>
+      <div class="sub">Hinweise & Datenquellen · VIN ${escapeHtml(report.vin)} · Report-ID ${escapeHtml(report.report_id)}</div>
+    </div>
+    <div class="chip">${escapeHtml(title || 'Fahrzeug')}</div>
+  </div>
+
+  <div class="box">
+    <div class="secH">Was dieser Bericht abdeckt</div>
+    <div class="para">
+      • Fahrzeugidentifikation und technische Fahrzeugdaten (VIN Decode)<br/>
+      • Diebstahlcheck basierend auf verfügbaren EU-Datenbanken<br/>
+      • Marktwert-Indikator, sofern ausreichende Marktdaten vorhanden sind
+    </div>
+  </div>
+
+  <div class="box" style="margin-top:12px">
+    <div class="secH">Wichtige Hinweise</div>
+    <div class="para">
+      • Dieser Bericht ist ein Informationsprodukt und ersetzt keine Vor-Ort-Prüfung.<br/>
+      • Es wird keine Garantie für Vollständigkeit, Unfallfreiheit oder Mängelfreiheit gegeben.<br/>
+      • Wenn einzelne Werte fehlen, lagen für dieses Fahrzeug keine Daten vor.
+    </div>
+  </div>
+
+  <div class="box" style="margin-top:12px">
+    <div class="secH">Disclaimer</div>
+    <div class="para">${escapeHtml(report.disclaimer)}</div>
+  </div>
+
+  <div class="small" style="margin-top:10px">
+    Erstellt am ${escapeHtml(new Date(report.generated_at).toLocaleString('de-DE'))}
+  </div>
+</div>
+
 </body>
 </html>`;
 }
 
-// ===== PDF Renderer =====
+// ====================== PDF RENDER ======================
 async function renderPdfToFile(html, outPath) {
   const browser = await puppeteer.launch({
     headless: IS_PROD ? chromium.headless : 'new',
@@ -652,37 +590,140 @@ async function renderPdfToFile(html, outPath) {
   }
 }
 
-// ===== Webhook auth =====
-function getIncomingSecret(req) {
-  const header = req.headers['x-webhook-secret'];
-  const query = req.query?.secret;
-  return (header || query || '').toString();
-}
+// ====================== WIX PAYLOAD PARSER ======================
 
-function requireWebhookSecret(req, res) {
-  if (!WEBHOOK_SECRET) {
-    return res.status(500).json({ success: false, error: 'server_misconfigured', hint: 'WEBHOOK_SECRET missing' });
+// Holt VIN aus vielen möglichen Feldern (damit es NIE “leer” ist ohne Hinweis)
+function extractVinFromOrder(order) {
+  if (!order) return null;
+
+  // 1) lineItems[].customTextFields[]
+  const lineItems = order.lineItems || order.line_items || [];
+  for (const li of lineItems) {
+    const ctf = li.customTextFields || li.custom_text_fields || li.customTextField || [];
+    if (Array.isArray(ctf)) {
+      for (const f of ctf) {
+        const title = String(f?.title || f?.name || '').toLowerCase();
+        const value = f?.value;
+        if (!value) continue;
+
+        // akzeptiere viele Titelvarianten
+        const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
+        if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+      }
+    }
   }
-  const provided = getIncomingSecret(req);
-  if (provided !== WEBHOOK_SECRET) {
-    return res.status(401).json({ success: false, error: 'unauthorized' });
+
+  // 2) fallback: order.customFields / customTextFields
+  const any = order.customFields || order.customTextFields || [];
+  if (Array.isArray(any)) {
+    for (const f of any) {
+      const title = String(f?.title || f?.name || '').toLowerCase();
+      const value = f?.value;
+      if (!value) continue;
+      const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
+      if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+    }
   }
+
   return null;
 }
 
-// ===== Routes =====
+function extractEmailFromOrder(order) {
+  if (!order) return null;
+
+  // Wix Stores: buyerInfo.email ist meist korrekt
+  const e1 = order?.buyerInfo?.email;
+  const e2 = order?.buyer_info?.email;
+  const e3 = order?.billingInfo?.address?.email;
+  const e4 = order?.billing_info?.address?.email;
+  const e5 = order?.shippingInfo?.address?.email;
+  const e6 = order?.shipping_info?.address?.email;
+
+  const email = e1 || e2 || e3 || e4 || e5 || e6 || null;
+  if (!email) return null;
+
+  return String(email).trim();
+}
+
+// Der Wix Trigger "Payment Added to Order" kann payload unterschiedlich liefern.
+// Wir versuchen mehrere Stellen.
+function extractOrderFromWixPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+
+  // häufig: { order: {...} }
+  if (payload.order) return payload.order;
+
+  // manchmal: { data: { order: {...} } }
+  if (payload.data?.order) return payload.data.order;
+
+  // manchmal: { body: { order: {...} } }
+  if (payload.body?.order) return payload.body.order;
+
+  return null;
+}
+
+function extractPurchaseFlowId(payload, order) {
+  return (
+    payload?.purchaseFlowId ||
+    payload?.purchase_flow_id ||
+    payload?.data?.purchaseFlowId ||
+    order?.purchaseFlowId ||
+    order?.id ||
+    payload?.orderId ||
+    payload?.data?.orderId ||
+    null
+  );
+}
+
+// ====================== SECURITY + IDEMPOTENCY ======================
+
+// Wix kann oft keine Custom Header setzen → wir erlauben ?secret=...
+function getIncomingSecret(req) {
+  const h = req.headers['x-webhook-secret'];
+  const q = req.query?.secret;
+  return (h || q || '').toString();
+}
+
+function checkWebhookAuth(req) {
+  if (!WEBHOOK_SECRET) return true; // falls du es bewusst leer lässt (nicht empfohlen)
+  return getIncomingSecret(req) === WEBHOOK_SECRET;
+}
+
+// Doppeltrigger verhindern (Wix schickt gern mehrfach)
+const processed = new Map(); // key -> expiresAt
+const DEDUPE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+
+function wasProcessed(key) {
+  const exp = processed.get(key);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    processed.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markProcessed(key) {
+  processed.set(key, Date.now() + DEDUPE_TTL_MS);
+}
+
+// ====================== ROUTES ======================
+
 app.get('/', (_req, res) => res.send('✅ FZB-24 VIN Report API läuft'));
 
 app.get('/api/version', (_req, res) => {
-  res.json({ ok: true, build: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown' });
+  // zeigt den commit hash aus Render/Git (falls vorhanden)
+  const build = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || crypto.createHash('sha1').update(String(Date.now())).digest('hex');
+  res.json({ ok: true, build });
 });
 
+// Debug-Echo (hilft beim Testen)
 app.post('/api/_debug/echo', (req, res) => {
-  const err = requireWebhookSecret(req, res);
-  if (err) return;
-  res.json({ ok: true, headers: req.headers, body: req.body });
+  if (!checkWebhookAuth(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  return res.json({ ok: true, headers: req.headers, body: req.body });
 });
 
+// Preview endpoint
 app.get('/api/report/:vin', async (req, res) => {
   try {
     const built = await buildPreviewReport(req.params.vin);
@@ -693,8 +734,10 @@ app.get('/api/report/:vin', async (req, res) => {
       preview: built.preview,
       preview_note: 'Vorschau: Es werden nur Basisdaten angezeigt. Premium-Bericht enthält zusätzliche Prüfungen und Details.',
       locked_sections: [
-        { title: 'Diebstahlcheck (EU)', hint: 'Prüfung über EU-Datenbanken (Details im PDF).' },
-        { title: 'Marktwert', hint: 'Marktwert-Indikator (wenn Daten verfügbar).' }
+        { title: 'Diebstahlcheck (EU)', hint: 'Prüfung über mehrere EU-Datenbanken (Details im PDF).' },
+        { title: 'Marktwert', hint: 'Marktwert-Indikator (wenn ausreichende Marktdaten vorhanden).' },
+        { title: 'Technische Daten', hint: 'Maße, Gewicht, Bremsen, Lenkung, Räder, CO₂ u.v.m.' },
+        { title: 'Hinweise & Datenquellen', hint: 'Transparente Erklärung, was geprüft wurde und was nicht.' }
       ]
     });
   } catch (err) {
@@ -703,53 +746,184 @@ app.get('/api/report/:vin', async (req, res) => {
   }
 });
 
-// MAIN: Wix automation calls this after payment
-app.post('/api/order-from-wix', async (req, res) => {
+// Premium JSON endpoint
+app.get('/api/premium-report/:vin', async (req, res) => {
   try {
-    const err = requireWebhookSecret(req, res);
-    if (err) return;
-
-    const { purchaseFlowId, email, vin } = parseWixPayload(req.body || {});
-    if (!email) return res.status(400).json({ success: false, error: 'missing_email' });
-    if (!vin) return res.status(400).json({ success: false, error: 'missing_vin' });
-
-    const built = await buildPremiumReport(vin, email);
+    const built = await buildPremiumReport(req.params.vin, null);
     if (!built.ok) return res.status(502).json({ success: false, ...built });
+    return res.status(200).json({ success: true, report: built.report });
+  } catch (err) {
+    console.error('❌ Fehler /api/premium-report:', err);
+    return res.status(500).json({ success: false, error: 'server_error', details: err.message });
+  }
+});
+
+// ✅ WIX WEBHOOK: Payment Added to Order -> PDF + Email
+app.post('/api/order-from-wix', async (req, res) => {
+  const start = Date.now();
+
+  try {
+    // 1) Auth
+    if (!checkWebhookAuth(req)) {
+      return res.status(401).json({ success: false, error: 'unauthorized' });
+    }
+
+    const payload = req.body || {};
+    const order = extractOrderFromWixPayload(payload);
+
+    const purchaseFlowId = extractPurchaseFlowId(payload, order) || `unknown_${crypto.randomBytes(6).toString('hex')}`;
+
+    // 2) Dedupe
+    if (wasProcessed(purchaseFlowId)) {
+      return res.status(200).json({
+        success: true,
+        status: 'duplicate_ignored',
+        purchaseFlowId,
+        message: 'Webhook bereits verarbeitet (Dedupe).'
+      });
+    }
+
+    const email = extractEmailFromOrder(order) || payload.email || null;
+    const vin = sanitizeVin(extractVinFromOrder(order) || payload.vin || '');
+
+    log('📦 Incoming purchaseFlowId:', purchaseFlowId);
+    log('📧 email:', email);
+    log('🚗 vin:', vin);
+
+    // 3) Safety: wenn VIN oder Email fehlt -> Admin Mail statt Kunde leer ausgehen lassen
+    if (!email || !vin || vin.length < 8) {
+      markProcessed(purchaseFlowId); // markieren, sonst spammt Wix
+
+      const subject = `FZB-24 ALERT: Bestellung ohne VIN/Email (${purchaseFlowId})`;
+      const body =
+        `Es kam ein Wix Payment-Webhook rein, aber VIN oder Email war leer/ungültig.\n\n` +
+        `purchaseFlowId: ${purchaseFlowId}\n` +
+        `email: ${email || '—'}\n` +
+        `vin: ${vin || '—'}\n\n` +
+        `Payload (gekürzt):\n${safeJson(payload, 8000)}\n`;
+
+      try {
+        await sendMail({
+          to: ADMIN_EMAIL,
+          subject,
+          text: body
+        });
+      } catch (mailErr) {
+        console.error('❌ Admin-Mail konnte nicht gesendet werden:', mailErr);
+      }
+
+      return res.status(200).json({
+        success: true,
+        status: 'needs_manual_check',
+        purchaseFlowId,
+        email,
+        vin,
+        message: 'VIN/Email fehlte. Admin wurde informiert.'
+      });
+    }
+
+    // 4) Bericht bauen
+    const built = await buildPremiumReport(vin, email);
+    if (!built.ok) {
+      markProcessed(purchaseFlowId);
+
+      // Admin informieren
+      await sendMail({
+        to: ADMIN_EMAIL,
+        subject: `FZB-24 ALERT: Vincario Fehler (${purchaseFlowId})`,
+        text:
+          `Vincario/Report build ist fehlgeschlagen.\n\n` +
+          `purchaseFlowId: ${purchaseFlowId}\n` +
+          `email: ${email}\n` +
+          `vin: ${vin}\n\n` +
+          `Fehler: ${built.error}\n` +
+          `Status: ${built.status}\n` +
+          `Raw: ${built.raw || '—'}\n`
+      });
+
+      return res.status(502).json({ success: false, ...built });
+    }
 
     const report = built.report;
-    const html = renderReportHtml(report);
 
-    const safeVin = sanitizeVin(report.vin);
+    // 5) PDF rendern
+    if (!PDF_ENABLED) {
+      markProcessed(purchaseFlowId);
+      await sendMail({
+        to: ADMIN_EMAIL,
+        subject: `FZB-24 INFO: PDF_ENABLED=false (${purchaseFlowId})`,
+        text: `PDF ist deaktiviert. Bestellung kann nicht ausgeliefert werden.\nVIN: ${vin}\nEmail: ${email}\n`
+      });
+
+      return res.status(200).json({
+        success: true,
+        status: 'pdf_disabled',
+        purchaseFlowId,
+        email,
+        vin
+      });
+    }
+
+    const html = renderReportHtml(report);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const fileName = `FZB24_${safeVin}_${report.report_id}_${stamp}.pdf`;
+    const fileName = `FZB24_${vin}_${stamp}.pdf`;
     const filePath = path.join(REPORTS_DIR, fileName);
 
     await renderPdfToFile(html, filePath);
 
-    const mailResult = await sendPdfEmail({
+    // 6) Kunden-Mail + Anhang
+    const mailSubject = `Dein FZB-24 Fahrzeugbericht (${vin})`;
+    const mailText =
+      `Hallo,\n\n` +
+      `anbei findest du deinen Fahrzeugbericht als PDF.\n\n` +
+      `VIN: ${vin}\n` +
+      `Report-ID: ${report.report_id}\n\n` +
+      `Hinweis: ${report.disclaimer}\n\n` +
+      `Viele Grüße\nFZB-24`;
+
+    await sendMail({
       to: email,
-      vin: report.vin,
-      reportId: report.report_id,
-      pdfPath: filePath
+      subject: mailSubject,
+      text: mailText,
+      attachments: [
+        {
+          filename: `FZB24_Report_${vin}.pdf`,
+          path: filePath
+        }
+      ]
     });
 
-    if (!mailResult.ok && !mailResult.skipped) {
-      return res.status(500).json({ success: false, error: 'mail_failed' });
-    }
+    // 7) Aufräumen
+    try {
+      fs.unlinkSync(filePath);
+    } catch {}
 
+    // 8) Dedupe markieren
+    markProcessed(purchaseFlowId);
+
+    const ms = Date.now() - start;
     return res.status(200).json({
       success: true,
       status: 'sent',
-      purchaseFlowId: purchaseFlowId || null,
+      purchaseFlowId,
       email,
-      vin: report.vin,
+      vin,
       reportId: report.report_id,
-      message: mailResult.skipped
-        ? `PDF erstellt, Mailversand übersprungen (${mailResult.reason}).`
-        : 'PDF erstellt und per E-Mail versendet.'
+      message: 'PDF erstellt und per E-Mail versendet.',
+      tookMs: ms
     });
   } catch (err) {
     console.error('❌ Fehler /api/order-from-wix:', err);
+
+    // Falls möglich Admin informieren
+    try {
+      await sendMail({
+        to: ADMIN_EMAIL,
+        subject: 'FZB-24 ALERT: Server Fehler bei order-from-wix',
+        text: `Server error:\n${err?.stack || err?.message || String(err)}`
+      });
+    } catch {}
+
     return res.status(500).json({ success: false, error: 'server_error', details: err.message });
   }
 });
