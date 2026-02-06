@@ -23,7 +23,15 @@ const VINCARIO_API_KEY = process.env.VINCARIO_API_KEY;
 const VINCARIO_SECRET_KEY = process.env.VINCARIO_SECRET_KEY;
 
 const DEBUG = (process.env.DEBUG || 'false').toLowerCase() === 'true';
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
+
+// Render hat oft RENDER_EXTERNAL_URL (Host ohne https://)
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || '';
+const FALLBACK_PUBLIC =
+  RENDER_EXTERNAL_URL
+    ? `https://${RENDER_EXTERNAL_URL}`
+    : `http://127.0.0.1:${PORT}`;
+
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || FALLBACK_PUBLIC;
 
 // PDF / Email
 const PDF_ENABLED = (process.env.PDF_ENABLED || 'true').toLowerCase() === 'true';
@@ -32,12 +40,12 @@ const EMAIL_ENABLED = (process.env.EMAIL_ENABLED || 'true').toLowerCase() === 't
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_SECURE = (process.env.SMTP_SECURE || 'true').toLowerCase() === 'true';
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
-const MAIL_FROM = process.env.MAIL_FROM || `FZB-24 <${SMTP_USER}>`;
+const SMTP_USER = process.env.SMTP_USER; // z.B. fzb24.info@gmail.com
+const SMTP_PASS = process.env.SMTP_PASS; // Google App Password
+const MAIL_FROM = process.env.MAIL_FROM || (SMTP_USER ? `FZB-24 <${SMTP_USER}>` : 'FZB-24');
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || SMTP_USER;
 
-// Webhook security
+// Webhook security (kommt aus .env)
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 
 // Render prod detection
@@ -47,6 +55,7 @@ const IS_PROD =
 
 if (!VINCARIO_API_KEY || !VINCARIO_SECRET_KEY) {
   console.error('❌ Missing VINCARIO_API_KEY or VINCARIO_SECRET_KEY in env');
+  // Wenn du gerade ohne Vincario testest: kommentier das aus.
   process.exit(1);
 }
 
@@ -57,7 +66,7 @@ if (EMAIL_ENABLED) {
   }
 }
 
-// Render: nutze /tmp (stabil, schnell, kein Repo-Ordner)
+// Render: nutze /tmp (stabil)
 const REPORTS_DIR = path.join('/tmp', 'reports');
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
@@ -67,16 +76,16 @@ function log(...args) {
 }
 
 function sanitizeVin(vin) {
-  return String(vin || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 25);
+  return String(vin || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 25);
 }
 
 function isLikelyVin(v) {
   const s = sanitizeVin(v);
-  // VIN ist normalerweise 17 Zeichen, manchmal liefern APIs 11+ (selten)
-  if (s.length < 11 || s.length > 17) return false;
-  // I, O, Q sind in VINs nicht erlaubt
-  if (/[IOQ]/.test(s)) return false;
-  return /^[A-HJ-NPR-Z0-9]+$/.test(s);
+  // VIN ist normalerweise 17 Zeichen (ohne I,O,Q), aber wir sind tolerant:
+  return s.length >= 11 && s.length <= 17;
 }
 
 function escapeHtml(s) {
@@ -601,11 +610,43 @@ async function renderPdfToFile(html, outPath) {
 
 // ====================== WIX PAYLOAD PARSER ======================
 
+// Payload kann 2 Hauptformen haben:
+// A) { data: { order: {...}, contact: {...} } }  (oft "payment added")
+// B) { data: { lineItems: [...], checkoutCustomFields: {...}, buyerEmail: "...", purchaseFlowId: "..." } } (oft "order placed")
 function extractOrderFromWixPayload(payload) {
   if (!payload || typeof payload !== 'object') return null;
-  if (payload.order) return payload.order;
-  if (payload.data?.order) return payload.data.order;
-  if (payload.body?.order) return payload.body.order;
+
+  // 1) häufig: payload.order
+  if (payload.order && typeof payload.order === 'object') return payload.order;
+
+  // 2) häufig: payload.data.order
+  if (payload.data?.order && typeof payload.data.order === 'object') return payload.data.order;
+
+  // 3) falls kein order-Objekt vorhanden ist, aber data enthält order-like Felder:
+  if (payload.data && typeof payload.data === 'object') {
+    const d = payload.data;
+
+    const looksOrderish =
+      d.purchaseFlowId || d.purchase_flow_id || d.orderNumber || d.order_number || Array.isArray(d.lineItems) || Array.isArray(d.line_items);
+
+    if (looksOrderish) {
+      // “synthetic order” bauen, damit unser Code überall gleich ist
+      return {
+        purchaseFlowId: d.purchaseFlowId || d.purchase_flow_id || null,
+        number: d.orderNumber || d.order_number || null,
+        buyerInfo: d.buyerInfo || (d.buyerEmail ? { email: d.buyerEmail } : undefined),
+        lineItems: d.lineItems || d.line_items || [],
+        extendedFields: d.extendedFields || d.extended_fields,
+        checkoutCustomFields: d.checkoutCustomFields || d.checkout_custom_fields,
+        customFields: d.customFields || d.custom_fields,
+        customTextFields: d.customTextFields || d.custom_text_fields
+      };
+    }
+  }
+
+  // 4) manchmal: payload.body.order
+  if (payload.body?.order && typeof payload.body.order === 'object') return payload.body.order;
+
   return null;
 }
 
@@ -614,62 +655,84 @@ function extractPurchaseFlowId(payload, order) {
     payload?.purchaseFlowId ||
     payload?.purchase_flow_id ||
     payload?.data?.purchaseFlowId ||
+    payload?.data?.purchase_flow_id ||
     order?.purchaseFlowId ||
-    order?.purchaseFlow?.id ||
     order?.id ||
     payload?.orderId ||
     payload?.data?.orderId ||
+    payload?.data?.id ||
     null
   );
 }
 
-function extractEmailFromOrder(order, payload) {
-  const e1 = order?.buyerInfo?.email;
-  const e2 = order?.buyer_info?.email;
-  const e3 = order?.billingInfo?.address?.email;
-  const e4 = order?.billing_info?.address?.email;
-  const e5 = order?.shippingInfo?.address?.email;
-  const e6 = order?.shipping_info?.address?.email;
+function extractEmailFromPayload(order, payload) {
+  // möglichst viele Stellen abklappern
+  const e =
+    order?.buyerInfo?.email ||
+    order?.buyer_info?.email ||
+    order?.buyerEmail ||
+    payload?.data?.buyerEmail ||
+    payload?.data?.buyer_email ||
+    payload?.data?.contact?.email ||
+    payload?.contact?.email ||
+    payload?.data?.billingInfo?.address?.email ||
+    payload?.data?.shippingInfo?.address?.email ||
+    payload?.data?.billingInfo?.contactDetails?.email ||
+    payload?.data?.email ||
+    payload?.email ||
+    null;
 
-  const email = e1 || e2 || e3 || e4 || e5 || e6 || payload?.email || payload?.data?.contact?.email || null;
-  return email ? String(email).trim() : null;
+  return e ? String(e).trim() : null;
 }
 
-function extractVinFromOrder(order) {
+// ✅ DAS ist die entscheidende Funktion: VIN aus ALLEN realistischen Wix-Stellen ziehen
+function extractVinFromOrder(order, payload) {
   if (!order) return null;
 
-  // 0) ✅ Wix "custom checkout field" landet bei dir hier:
+  // Helper: aus object-values eine VIN ziehen
+  const scanObjectForVin = (obj) => {
+    if (!obj || typeof obj !== 'object') return null;
+
+    // 1) keys, die nach FIN/VIN aussehen
+    for (const [k, v] of Object.entries(obj)) {
+      if (!v) continue;
+      const key = String(k).toLowerCase();
+      const val = String(v).trim();
+
+      const keyHits = ['vin', 'fin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
+      if (keyHits.some(h => key.includes(h)) && isLikelyVin(val)) return sanitizeVin(val);
+
+      // 2) Notfall: value sieht wie VIN aus
+      if (isLikelyVin(val)) return sanitizeVin(val);
+    }
+
+    return null;
+  };
+
+  // 0) Wix Custom Checkout Feld landet bei dir oft hier:
   // order.extendedFields.namespaces._user_fields.{fahrgestellnummer_fin_1: "..."}
   const userFields =
     order?.extendedFields?.namespaces?._user_fields ||
     order?.extended_fields?.namespaces?._user_fields ||
     null;
 
-  if (userFields && typeof userFields === 'object') {
-    for (const [k, v] of Object.entries(userFields)) {
-      if (!v) continue;
-      const key = String(k || '').toLowerCase();
-      const val = String(v || '').trim();
-      if (!val) continue;
+  const fromUserFields = scanObjectForVin(userFields);
+  if (fromUserFields) return fromUserFields;
 
-      // akzeptiere viele Key-Varianten
-      if (
-        key.includes('vin') ||
-        key.includes('fin') ||
-        key.includes('fahrgestell') ||
-        key.includes('fahrgestellnummer')
-      ) {
-        return sanitizeVin(val);
-      }
+  // 0b) Manche Payloads liefern checkoutCustomFields (kann leer sein, aber wenn nicht, dann hier)
+  const ccf =
+    order?.checkoutCustomFields ||
+    order?.checkout_custom_fields ||
+    payload?.data?.checkoutCustomFields ||
+    payload?.data?.checkout_custom_fields ||
+    null;
 
-      // falls Key nicht passt, aber Value sieht nach VIN aus:
-      const s = sanitizeVin(val);
-      if (s.length >= 11 && s.length <= 17) return s;
-    }
-  }
+  // checkoutCustomFields kann z.B. { fahrgestellnummer_fin_1: "WBA..." } sein
+  const fromCheckoutCustom = scanObjectForVin(ccf);
+  if (fromCheckoutCustom) return fromCheckoutCustom;
 
-  // 1) lineItems[].customTextFields[]
-  const lineItems = order.lineItems || order.line_items || [];
+  // 1) lineItems[].customTextFields[] (falls du das mal nutzt)
+  const lineItems = order.lineItems || order.line_items || payload?.data?.lineItems || payload?.data?.line_items || [];
   for (const li of lineItems) {
     const ctf = li.customTextFields || li.custom_text_fields || li.customTextField || [];
     if (Array.isArray(ctf)) {
@@ -679,29 +742,38 @@ function extractVinFromOrder(order) {
         if (!value) continue;
 
         const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer', 'vehicle identification', 'vehicle id'];
-        if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+        if (hits.some(h => title.includes(h)) && isLikelyVin(value)) return sanitizeVin(value);
+
+        if (isLikelyVin(value)) return sanitizeVin(value);
       }
     }
   }
 
   // 2) fallback: order.customFields / customTextFields
-  const any = order.customFields || order.customTextFields || [];
+  const any = order.customFields || order.customTextFields || order.custom_fields || order.custom_text_fields || [];
   if (Array.isArray(any)) {
     for (const f of any) {
       const title = String(f?.title || f?.name || '').toLowerCase();
       const value = f?.value;
       if (!value) continue;
+
       const hits = ['fin', 'vin', 'fahrgestell', 'fahrgestellnummer'];
-      if (hits.some(h => title.includes(h))) return sanitizeVin(value);
+      if (hits.some(h => title.includes(h)) && isLikelyVin(value)) return sanitizeVin(value);
+
+      if (isLikelyVin(value)) return sanitizeVin(value);
     }
   }
+
+  // 3) letzter Notfall: payload.data direkt scannen (wenn Wix wieder anders liefert)
+  const deep = scanObjectForVin(payload?.data);
+  if (deep) return deep;
 
   return null;
 }
 
-
 // ====================== SECURITY + IDEMPOTENCY ======================
 
+// Wix kann oft keine Custom Header setzen → wir erlauben ?secret=...
 function getIncomingSecret(req) {
   const h = req.headers['x-webhook-secret'];
   const q = req.query?.secret;
@@ -709,10 +781,11 @@ function getIncomingSecret(req) {
 }
 
 function checkWebhookAuth(req) {
-  if (!WEBHOOK_SECRET) return true;
+  if (!WEBHOOK_SECRET) return true; // wenn bewusst leer (nicht empfohlen)
   return getIncomingSecret(req) === WEBHOOK_SECRET;
 }
 
+// Doppeltrigger verhindern
 const processed = new Map(); // key -> expiresAt
 const DEDUPE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
@@ -739,14 +812,17 @@ app.get('/api/version', (_req, res) => {
     process.env.RENDER_GIT_COMMIT ||
     process.env.GIT_COMMIT ||
     crypto.createHash('sha1').update(String(Date.now())).digest('hex');
+
   res.json({ ok: true, build });
 });
 
+// Debug-Echo
 app.post('/api/_debug/echo', (req, res) => {
   if (!checkWebhookAuth(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
   return res.json({ ok: true, headers: req.headers, body: req.body });
 });
 
+// Preview endpoint
 app.get('/api/report/:vin', async (req, res) => {
   try {
     const built = await buildPreviewReport(req.params.vin);
@@ -769,6 +845,7 @@ app.get('/api/report/:vin', async (req, res) => {
   }
 });
 
+// Premium JSON endpoint
 app.get('/api/premium-report/:vin', async (req, res) => {
   try {
     const built = await buildPremiumReport(req.params.vin, null);
@@ -780,19 +857,24 @@ app.get('/api/premium-report/:vin', async (req, res) => {
   }
 });
 
+// ✅ WIX WEBHOOK: Payment Added to Order -> PDF + Email
 app.post('/api/order-from-wix', async (req, res) => {
   const start = Date.now();
 
   try {
+    // 1) Auth
     if (!checkWebhookAuth(req)) {
       return res.status(401).json({ success: false, error: 'unauthorized' });
     }
 
     const payload = req.body || {};
     const order = extractOrderFromWixPayload(payload);
-    const purchaseFlowId =
-      extractPurchaseFlowId(payload, order) || `unknown_${crypto.randomBytes(6).toString('hex')}`;
 
+    const purchaseFlowId =
+      extractPurchaseFlowId(payload, order) ||
+      `unknown_${crypto.randomBytes(6).toString('hex')}`;
+
+    // 2) Dedupe
     if (wasProcessed(purchaseFlowId)) {
       return res.status(200).json({
         success: true,
@@ -802,13 +884,7 @@ app.post('/api/order-from-wix', async (req, res) => {
       });
     }
 
-    const email =
-  extractEmailFromOrder(order) ||
-  payload?.data?.contact?.email ||
-  payload?.contact?.email ||
-  payload?.email ||
-  null;
-
+    const email = extractEmailFromPayload(order, payload);
     const vinRaw = extractVinFromOrder(order, payload);
     const vin = vinRaw ? sanitizeVin(vinRaw) : '';
 
@@ -816,8 +892,9 @@ app.post('/api/order-from-wix', async (req, res) => {
     log('📧 email:', email);
     log('🚗 vin:', vin);
 
+    // 3) Safety: wenn VIN oder Email fehlt -> Admin Mail statt Kunde leer ausgehen lassen
     if (!email || !vin || vin.length < 11) {
-      markProcessed(purchaseFlowId);
+      markProcessed(purchaseFlowId); // markieren, sonst spammt Wix
 
       const subject = `FZB-24 ALERT: Bestellung ohne VIN/Email (${purchaseFlowId})`;
       const body =
@@ -828,7 +905,11 @@ app.post('/api/order-from-wix', async (req, res) => {
         `Payload (gekürzt):\n${safeJson(payload, 8000)}\n`;
 
       try {
-        await sendMail({ to: ADMIN_EMAIL, subject, text: body });
+        await sendMail({
+          to: ADMIN_EMAIL,
+          subject,
+          text: body
+        });
       } catch (mailErr) {
         console.error('❌ Admin-Mail konnte nicht gesendet werden:', mailErr);
       }
@@ -843,10 +924,12 @@ app.post('/api/order-from-wix', async (req, res) => {
       });
     }
 
+    // 4) Bericht bauen
     const built = await buildPremiumReport(vin, email);
     if (!built.ok) {
       markProcessed(purchaseFlowId);
 
+      // Admin informieren
       await sendMail({
         to: ADMIN_EMAIL,
         subject: `FZB-24 ALERT: Vincario Fehler (${purchaseFlowId})`,
@@ -865,8 +948,10 @@ app.post('/api/order-from-wix', async (req, res) => {
 
     const report = built.report;
 
+    // 5) PDF rendern
     if (!PDF_ENABLED) {
       markProcessed(purchaseFlowId);
+
       await sendMail({
         to: ADMIN_EMAIL,
         subject: `FZB-24 INFO: PDF_ENABLED=false (${purchaseFlowId})`,
@@ -889,6 +974,7 @@ app.post('/api/order-from-wix', async (req, res) => {
 
     await renderPdfToFile(html, filePath);
 
+    // 6) Kunden-Mail + Anhang (normaler Text wie du wolltest)
     const mailSubject = `Dein FZB-24 Fahrzeugbericht (${vin})`;
     const mailText =
       `Hallo,\n\n` +
@@ -896,19 +982,25 @@ app.post('/api/order-from-wix', async (req, res) => {
       `VIN: ${vin}\n` +
       `Report-ID: ${report.report_id}\n\n` +
       `Hinweis: ${report.disclaimer}\n\n` +
-      `Viele Grüße\nFZB-24`;
+      `Viele Grüße\n` +
+      `FZB-24`;
 
     await sendMail({
       to: email,
       subject: mailSubject,
       text: mailText,
       attachments: [
-        { filename: `FZB24_Report_${vin}.pdf`, path: filePath }
+        {
+          filename: `FZB24_Report_${vin}.pdf`,
+          path: filePath
+        }
       ]
     });
 
+    // 7) Aufräumen
     try { fs.unlinkSync(filePath); } catch {}
 
+    // 8) Dedupe markieren
     markProcessed(purchaseFlowId);
 
     const ms = Date.now() - start;
@@ -925,6 +1017,7 @@ app.post('/api/order-from-wix', async (req, res) => {
   } catch (err) {
     console.error('❌ Fehler /api/order-from-wix:', err);
 
+    // Admin informieren
     try {
       await sendMail({
         to: ADMIN_EMAIL,
